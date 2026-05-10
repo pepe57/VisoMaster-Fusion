@@ -280,10 +280,14 @@ def paste_selected_face_parameters(
         if main_window.video_processor.processing:
             main_window.video_processor.ui_state_is_dirty = True
             with main_window.video_processor.state_lock:
-                if main_window.video_processor.feeder_parameters and face_id in main_window.video_processor.feeder_parameters:
+                if (
+                    main_window.video_processor.feeder_parameters
+                    and face_id in main_window.video_processor.feeder_parameters
+                ):
                     import copy
-                    main_window.video_processor.feeder_parameters[face_id] = copy.deepcopy(
-                        main_window.parameters[face_id]
+
+                    main_window.video_processor.feeder_parameters[face_id] = (
+                        copy.deepcopy(main_window.parameters[face_id])
                     )
     set_widgets_values_using_face_id_parameters(main_window, face_id=face_id)
     return True
@@ -307,10 +311,14 @@ def reset_selected_face_parameters(
         if main_window.video_processor.processing:
             main_window.video_processor.ui_state_is_dirty = True
             with main_window.video_processor.state_lock:
-                if main_window.video_processor.feeder_parameters and face_id in main_window.video_processor.feeder_parameters:
+                if (
+                    main_window.video_processor.feeder_parameters
+                    and face_id in main_window.video_processor.feeder_parameters
+                ):
                     import copy
-                    main_window.video_processor.feeder_parameters[face_id] = copy.deepcopy(
-                        main_window.parameters[face_id]
+
+                    main_window.video_processor.feeder_parameters[face_id] = (
+                        copy.deepcopy(main_window.parameters[face_id])
                     )
     set_widgets_values_using_face_id_parameters(main_window, face_id=face_id)
     return True

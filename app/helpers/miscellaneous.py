@@ -1126,8 +1126,8 @@ def keypoints_adjustments(
 
                 # Calculate the average scale to get a baseline reference for the overall face size.
                 base_scale = (scale_x + scale_y) / 2.0
-                
-                # We allow the axis to compress (down to 30% of the baseline scale) 
+
+                # We allow the axis to compress (down to 30% of the baseline scale)
                 # However, we prevent it from dropping below this threshold, avoiding the "miniature face" bug.
                 scale_x = np.clip(scale_x, base_scale * 0.3, base_scale * 2.5)
                 scale_y = np.clip(scale_y, base_scale * 0.3, base_scale * 2.5)

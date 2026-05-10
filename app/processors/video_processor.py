@@ -76,11 +76,12 @@ MAX_CONSECUTIVE_ERRORS = (
 # Audio-Video Sync: Always use segmented extraction when frames are skipped (perfect sync)
 # Simple extraction used when no frames are skipped (no sync issues)
 
+
 def fast_state_copy(obj):
     """
     Custom fast deepcopy for HPC video pipelines.
     Isolates dictionaries and lists to guarantee temporal independence for each frame worker,
-    but strictly passes heavy arrays (PyTorch Tensors, NumPy arrays) by reference 
+    but strictly passes heavy arrays (PyTorch Tensors, NumPy arrays) by reference
     to prevent RAM and VRAM memory leaks.
     """
     if isinstance(obj, dict):
@@ -104,7 +105,9 @@ def fast_state_copy(obj):
             return obj
         # Fallback for custom objects
         import copy
+
         return copy.copy(obj)
+
 
 class VideoProcessor(QObject):
     """
@@ -210,7 +213,7 @@ class VideoProcessor(QObject):
         )
         self.triggered_by_job_manager: bool = False  # For multi-segment job integration
         self.active_output_folder: str = ""
-        self.ui_state_is_dirty = True # For state changes
+        self.ui_state_is_dirty = True  # For state changes
 
         # --- Subprocesses ---
         self.virtcam: pyvirtualcam.Camera | None = None
@@ -320,7 +323,7 @@ class VideoProcessor(QObject):
         if not self.processing and not self.is_processing_segments:
             del frame
             return
-        
+
         # Drop stale frames arriving late from slower threads if we already scrubbed or played past them.
         # This prevents RAM bloat and keeps the metronome buffer clean.
         if self.file_type == "video" and frame_number < self.next_frame_to_display:
@@ -887,7 +890,9 @@ class VideoProcessor(QObject):
                     # 1. MASTER CACHE (Dirty Flag)
                     # Update the master blueprint only if the UI or a marker changed.
                     # This saves CPU cycles by not locking the UI state 30 times a second.
-                    if getattr(self, 'ui_state_is_dirty', True) or not hasattr(self, '_cached_params'):
+                    if getattr(self, "ui_state_is_dirty", True) or not hasattr(
+                        self, "_cached_params"
+                    ):
                         self._cached_params = fast_state_copy(self.feeder_parameters)
                         self._cached_control = fast_state_copy(self.feeder_control)
                         self.ui_state_is_dirty = False
@@ -899,7 +904,7 @@ class VideoProcessor(QObject):
                     # while passing heavy tensors by reference to keep RAM flat and FPS high.
                     local_params_for_worker = fast_state_copy(self._cached_params)
                     local_control_for_worker = fast_state_copy(self._cached_control)
-                    
+
                     local_params_for_worker = {}
                     for face_id, face_data in self._cached_params.items():
                         if isinstance(face_data, dict):
@@ -1003,20 +1008,29 @@ class VideoProcessor(QObject):
 
                 # The worker pool expects a task.
                 # For webcam, we must read the *current* global parameters.
-                # We use the same pattern as the video feeder to prevent Thread Bleed 
+                # We use the same pattern as the video feeder to prevent Thread Bleed
                 # on nested dictionaries while keeping CPU usage low and RAM flat.
                 with self.main_window.models_processor.model_lock:
-                    
                     # 1. Update master cache only if UI changed
-                    if getattr(self, 'ui_state_is_dirty', True) or not hasattr(self, '_webcam_cached_params'):
-                        self._webcam_cached_params = fast_state_copy(self.main_window.parameters)
-                        self._webcam_cached_control = fast_state_copy(self.main_window.control)
+                    if getattr(self, "ui_state_is_dirty", True) or not hasattr(
+                        self, "_webcam_cached_params"
+                    ):
+                        self._webcam_cached_params = fast_state_copy(
+                            self.main_window.parameters
+                        )
+                        self._webcam_cached_control = fast_state_copy(
+                            self.main_window.control
+                        )
                         self.ui_state_is_dirty = False
                         print("[INFO] Global State changed : Dirty flag cleared")
 
                     # 2. Spawn isolated state for this specific webcam frame
-                    local_params_for_worker = fast_state_copy(self._webcam_cached_params)
-                    local_control_for_worker = fast_state_copy(self._webcam_cached_control)
+                    local_params_for_worker = fast_state_copy(
+                        self._webcam_cached_params
+                    )
+                    local_control_for_worker = fast_state_copy(
+                        self._webcam_cached_control
+                    )
 
                 # --- Inject Sequential Detection ---
                 if len(self.main_window.target_faces) > 0:
@@ -1262,7 +1276,9 @@ class VideoProcessor(QObject):
         )
 
         # Notify ModelsProcessor of the frame that was just displayed to trigger pending unloads
-        self.main_window.models_processor.check_deferred_unloads(frame_number_to_display)
+        self.main_window.models_processor.check_deferred_unloads(
+            frame_number_to_display
+        )
         # --- 8. Clean up and Increment ---
         if self.file_type != "webcam":
             # Increment for next frame
@@ -2113,10 +2129,12 @@ class VideoProcessor(QObject):
         self._log_processing_summary(processing_time_sec, num_frames_processed)
 
         # MP-REFRESH: Force a refresh of the current frame to match current UI state.
-        # This prevents confusion if parameters were changed but not yet processed 
+        # This prevents confusion if parameters were changed but not yet processed
         # by a worker before the manual stop.
         if self.file_type in ["video", "image"]:
-            print("[INFO] Stop Processing: Triggering final frame refresh to match UI state.")
+            print(
+                "[INFO] Stop Processing: Triggering final frame refresh to match UI state."
+            )
             # We call this asynchronously to let the UI finish its current state cleanup first
             self.process_current_frame(synchronous=False)
 

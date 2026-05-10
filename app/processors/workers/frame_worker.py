@@ -127,7 +127,7 @@ class FrameWorker(threading.Thread):
         # FW-MEM-01: Gabor kernel cache as LRU-bounded OrderedDict
         from collections import OrderedDict as _OrderedDict
 
-        self._gabor_kernels_expanded_cache = _OrderedDict()
+        self._gabor_kernels_expanded_cache: _OrderedDict = _OrderedDict()
         self._gabor_kernels_cache: _OrderedDict = (
             _OrderedDict()
         )  # keyed by (kernel_size,sigma,lambd,gamma,psi,N,device_str)
@@ -3781,6 +3781,7 @@ class FrameWorker(threading.Thread):
             else:
                 dfm_res = 256  # Fallback
                 from collections import deque
+
                 queue = deque([dfm_model])
                 visited = set([id(dfm_model)])
                 found_res = None
@@ -3807,10 +3808,14 @@ class FrameWorker(threading.Thread):
                     dfm_res = found_res
                 elif hasattr(dfm_model, "_dfm_filename_fallback"):
                     import re
-                    match = re.search(r"(128|192|224|256|320|384|448|512)", dfm_model._dfm_filename_fallback)
+
+                    match = re.search(
+                        r"(128|192|224|256|320|384|448|512)",
+                        dfm_model._dfm_filename_fallback,
+                    )
                     if match:
                         dfm_res = int(match.group(1))
-                
+
                 # Cache it for all future frames!
                 dfm_model._cached_dfm_res = dfm_res
 
@@ -5888,17 +5893,16 @@ class FrameWorker(threading.Thread):
         )  # [N, 1, k, k]
 
         # FW-PERF-06: cache expanded kernels keyed by (shape, C)
-        if not hasattr(self, "_gabor_kernels_expanded_cache"):
-            from collections import OrderedDict
-            self._gabor_kernels_expanded_cache = OrderedDict()
-            
         expand_cache_key = (*kernels.shape, C)
+
         if expand_cache_key not in self._gabor_kernels_expanded_cache:
             MAX_GABOR_EXPANDED_CACHE = 16
             if len(self._gabor_kernels_expanded_cache) >= MAX_GABOR_EXPANDED_CACHE:
                 self._gabor_kernels_expanded_cache.popitem(last=False)
-            self._gabor_kernels_expanded_cache[expand_cache_key] = kernels.repeat_interleave(C, dim=0)
-            
+            self._gabor_kernels_expanded_cache[expand_cache_key] = (
+                kernels.repeat_interleave(C, dim=0)
+            )
+
         weight = self._gabor_kernels_expanded_cache[expand_cache_key]
         out = F.conv2d(
             image,  # [1, C, H, W]

@@ -287,7 +287,7 @@ class FaceRestorers:
         # outpred = torch.add(torch.mul(outpred, alpha), torch.mul(swapped_face_upscaled, 1-alpha))
 
         # --- EXPLICIT CLEANUP ---
-        # Explicitly delete local intermediate tensors to free VRAM immediately 
+        # Explicitly delete local intermediate tensors to free VRAM immediately
         # before returning the final image. This keeps the VRAM peak perfectly flat.
         try:
             del temp

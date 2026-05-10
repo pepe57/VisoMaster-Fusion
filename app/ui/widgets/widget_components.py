@@ -957,7 +957,10 @@ class TargetFaceCardButton(CardButton):
             main_window.current_kv_tensors_map = self.assigned_kv_map
 
         # Dirty Flag
-        if hasattr(self.main_window, "video_processor") and self.main_window.video_processor:
+        if (
+            hasattr(self.main_window, "video_processor")
+            and self.main_window.video_processor
+        ):
             self.main_window.video_processor.ui_state_is_dirty = True
 
     def create_context_menu(self):

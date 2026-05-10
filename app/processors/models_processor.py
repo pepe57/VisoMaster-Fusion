@@ -899,7 +899,7 @@ class ModelsProcessor(QtCore.QObject):
         if not self.force_unload_in_progress:
             if self.main_window.control.get("KeepModelsAliveToggle", False):
                 return  # Skip unloading
-        
+
         # --- SMART UNLOAD: Intercept if video is playing ---
         if not force_immediate and not self.force_unload_in_progress:
             vp = getattr(self.main_window, "video_processor", None)
@@ -907,8 +907,13 @@ class ModelsProcessor(QtCore.QObject):
                 # Video is playing, get the feeder's current frame and defer
                 target_frame = getattr(vp, "current_frame_number", 0) + 1
                 with self.model_lock:
-                    self.deferred_unloads[model_name_to_unload] = {"type": "dfm", "target_frame": target_frame}
-                print(f"[INFO] Smart Unload: Deferring DFM '{model_name_to_unload}' unload after frame {target_frame}")
+                    self.deferred_unloads[model_name_to_unload] = {
+                        "type": "dfm",
+                        "target_frame": target_frame,
+                    }
+                print(
+                    f"[INFO] Smart Unload: Deferring DFM '{model_name_to_unload}' unload after frame {target_frame}"
+                )
                 return
 
         with self.model_lock:
@@ -937,7 +942,7 @@ class ModelsProcessor(QtCore.QObject):
         if not self.force_unload_in_progress:
             if self.main_window.control.get("KeepModelsAliveToggle", False):
                 return  # Skip unloading
-        
+
         # --- SMART UNLOAD: Intercept if video is playing ---
         if not force_immediate and not self.force_unload_in_progress:
             vp = getattr(self.main_window, "video_processor", None)
@@ -945,8 +950,13 @@ class ModelsProcessor(QtCore.QObject):
                 # Video is playing, get the feeder's current frame and defer
                 target_frame = getattr(vp, "current_frame_number", 0) + 1
                 with self.model_lock:
-                    self.deferred_unloads[model_name_to_unload] = {"type": "onnx", "target_frame": target_frame}
-                print(f"[INFO] Smart Unload: Deferring ONNX '{model_name_to_unload}' unload after frame {target_frame}")
+                    self.deferred_unloads[model_name_to_unload] = {
+                        "type": "onnx",
+                        "target_frame": target_frame,
+                    }
+                print(
+                    f"[INFO] Smart Unload: Deferring ONNX '{model_name_to_unload}' unload after frame {target_frame}"
+                )
                 return
 
         with self.model_lock:
@@ -976,7 +986,7 @@ class ModelsProcessor(QtCore.QObject):
         Live Verification JIT: Checks the UI state dynamically to see if a model is still needed.
         Used exclusively before a deferred unload to prevent accidental purging.
         """
-        from app.ui.widgets.models_toggle_data import MODELS_TOGGLE_MAP, ToggleScope
+        from app.ui.widgets.models_toggle_data import MODELS_TOGGLE_MAP
 
         # Thread Safety: Use dict() to safely create shallow copies and avoid 'dictionary changed size' errors
         try:
@@ -987,62 +997,78 @@ class ModelsProcessor(QtCore.QObject):
             ctrl = getattr(self.main_window, "control", {})
 
         # Create a unified flat dictionary for global lookups
-        live_global = {**params, **ctrl} if isinstance(params, dict) and isinstance(ctrl, dict) else params
+        live_global = (
+            {**params, **ctrl}
+            if isinstance(params, dict) and isinstance(ctrl, dict)
+            else params
+        )
 
         # 1. SPECIAL CASE: FACE RESTORERS
-        if hasattr(self, "face_restorers") and hasattr(self.face_restorers, "model_map"):
+        if hasattr(self, "face_restorers") and hasattr(
+            self.face_restorers, "model_map"
+        ):
             expected_combo = None
             for combo_str, ort_name in self.face_restorers.model_map.items():
                 if ort_name == model_name:
                     expected_combo = combo_str
                     break
-            
+
             if expected_combo is not None:
+
                 def is_restorer_requested(p) -> bool:
                     if not hasattr(p, "get"):
                         return False
-                    
-                    if p.get("FaceRestorerEnableToggle", False) and p.get("FaceRestorerTypeSelection") == expected_combo:
+
+                    if (
+                        p.get("FaceRestorerEnableToggle", False)
+                        and p.get("FaceRestorerTypeSelection") == expected_combo
+                    ):
                         return True
-                    if p.get("FaceRestorerEnable2Toggle", False) and not p.get("FaceRestorerEnable2EndToggle", False):
+                    if p.get("FaceRestorerEnable2Toggle", False) and not p.get(
+                        "FaceRestorerEnable2EndToggle", False
+                    ):
                         if p.get("FaceRestorerType2Selection") == expected_combo:
                             return True
-                    if p.get("FaceRestorerEnable2EndToggle", False) and p.get("FaceRestorerType2Selection") == expected_combo:
+                    if (
+                        p.get("FaceRestorerEnable2EndToggle", False)
+                        and p.get("FaceRestorerType2Selection") == expected_combo
+                    ):
                         return True
                     return False
 
                 # 1. Global check
                 if is_restorer_requested(live_global):
                     return True
-                
+
                 # 2. Exhaustive verification for each active face in memory
                 if hasattr(params, "items"):
                     for face_id, face_params in params.items():
                         if is_restorer_requested(face_params):
                             return True
-                            
-                return False # No face requested this restorer, we can safely unload it
 
+                return False  # No face requested this restorer, we can safely unload it
 
         # 2. GENERAL CASE: MODELS TOGGLE MAP
         toggles = MODELS_TOGGLE_MAP.get(model_name)
         if not toggles:
-            return True # Core models without UI toggles are always assumed needed
-            
+            return True  # Core models without UI toggles are always assumed needed
+
         for toggle in toggles:
             target_key = toggle.key
-            
+
             if hasattr(ctrl, "get") and ctrl.get(target_key, False):
                 return True
-                
+
             if hasattr(params, "get") and params.get(target_key, False):
                 return True
-                
+
             if hasattr(params, "items"):
                 for face_id, face_params in params.items():
-                    if hasattr(face_params, "get") and face_params.get(target_key, False):
+                    if hasattr(face_params, "get") and face_params.get(
+                        target_key, False
+                    ):
                         return True
-                        
+
         return False
 
     def check_deferred_unloads(self, current_displayed_frame: int):
@@ -1052,23 +1078,27 @@ class ModelsProcessor(QtCore.QObject):
         """
         if not self.deferred_unloads:
             return
-            
+
         with self.model_lock:
             to_unload = []
             for model_name, data in self.deferred_unloads.items():
                 if current_displayed_frame >= data["target_frame"]:
                     to_unload.append((model_name, data["type"]))
-            
+
             for model_name, m_type in to_unload:
                 # Remove from pending list regardless
                 del self.deferred_unloads[model_name]
-                
+
                 # --- JIT LIVE CHECK ---
                 if self.is_model_active_in_ui(model_name):
-                    print(f"[INFO] Smart Unload JIT: Option re-enabled for '{model_name}'. Cancelling unload.")
+                    print(
+                        f"[INFO] Smart Unload JIT: Option re-enabled for '{model_name}'. Cancelling unload."
+                    )
                     continue  # Safe! We skip the unload.
-                
-                print(f"[INFO] Smart Unload: Trigger reached. Actually releasing '{model_name}'.")
+
+                print(
+                    f"[INFO] Smart Unload: Trigger reached. Actually releasing '{model_name}'."
+                )
                 if m_type == "onnx":
                     self.unload_model(model_name, force_immediate=True)
                 elif m_type == "dfm":
@@ -1085,16 +1115,18 @@ class ModelsProcessor(QtCore.QObject):
         with self.model_lock:
             if not self.deferred_unloads:
                 return
-            
+
             print("[INFO] Smart Stop: Executing pending UI unloads...")
             for model_name, data in list(self.deferred_unloads.items()):
                 del self.deferred_unloads[model_name]
-                
+
                 # --- LIVE UI VERIFICATION (JIT) ---
                 if self.is_model_active_in_ui(model_name):
-                    print(f"[INFO] Smart Stop JIT: Option is active for '{model_name}'. Keeping model in VRAM.")
+                    print(
+                        f"[INFO] Smart Stop JIT: Option is active for '{model_name}'. Keeping model in VRAM."
+                    )
                     continue  # We skip the unload, leaving the model ready for the next run!
-                
+
                 print(f"[INFO] Smart Stop: Releasing '{model_name}'.")
                 if data["type"] == "onnx":
                     self.unload_model(model_name, force_immediate=True)
@@ -1102,7 +1134,7 @@ class ModelsProcessor(QtCore.QObject):
                     self.unload_dfm_model(model_name, force_immediate=True)
                 elif data["type"] == "kv":
                     self.unload_kv_extractor(force_immediate=True)
-    
+
     def showModelLoadingProgressBar(self):
         """Shows the model-loading progress dialog in the UI."""
         self.main_window.model_load_dialog.show()
@@ -1372,7 +1404,7 @@ class ModelsProcessor(QtCore.QObject):
 
     def unload_kv_extractor(self, force_immediate=False):
         """Unloads the KVExtractor model and clears associated memory."""
-        
+
         # Check if unloading should be skipped
         if not self.force_unload_in_progress:
             if self.main_window.control.get("KeepModelsAliveToggle", False):
@@ -1385,8 +1417,13 @@ class ModelsProcessor(QtCore.QObject):
                 # Video is playing, get the feeder's current frame and defer
                 target_frame = getattr(vp, "current_frame_number", 0) + 1
                 with self.model_lock:
-                    self.deferred_unloads["KVExtractor"] = {"type": "kv", "target_frame": target_frame}
-                print(f"[INFO] Smart Unload: Deferring KV Extractor unload after frame {target_frame}")
+                    self.deferred_unloads["KVExtractor"] = {
+                        "type": "kv",
+                        "target_frame": target_frame,
+                    }
+                print(
+                    f"[INFO] Smart Unload: Deferring KV Extractor unload after frame {target_frame}"
+                )
                 return
 
         with self.model_lock:
