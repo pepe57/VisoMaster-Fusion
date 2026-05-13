@@ -76,16 +76,16 @@ class FaceMasks:
         io = ort_session.io_binding()
         io.bind_input(
             "input",
-            self.models_processor.device,
-            0,
+            self.models_processor.device_type,
+            self.models_processor.binding_device_id,
             np.float32,
             (1, 3, 512, 512),
             x.data_ptr(),
         )
         io.bind_output(
             "output",
-            self.models_processor.device,
-            0,
+            self.models_processor.device_type,
+            self.models_processor.binding_device_id,
             np.float32,
             (1, 19, 512, 512),
             out.data_ptr(),
@@ -101,9 +101,9 @@ class FaceMasks:
 
         try:
             # PRE-INFERENCE SYNC: Ensure PyTorch memory is ready
-            if self.models_processor.device == "cuda":
+            if self.models_processor.device_type == "cuda":
                 torch.cuda.current_stream().synchronize()
-            elif self.models_processor.device != "cpu":
+            elif self.models_processor.device_type != "cpu":
                 self.models_processor.syncvec.cpu()
 
             ort_session.run_with_iobinding(io)
@@ -1083,16 +1083,16 @@ class FaceMasks:
         io_binding = ort_session.io_binding()
         io_binding.bind_input(
             name="img",
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=(1, 3, 256, 256),
             buffer_ptr=image.data_ptr(),
         )
         io_binding.bind_output(
             name="output",
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=(1, 1, 256, 256),
             buffer_ptr=output.data_ptr(),
@@ -1107,9 +1107,9 @@ class FaceMasks:
 
         try:
             # PRE-INFERENCE SYNC
-            if self.models_processor.device == "cuda":
+            if self.models_processor.device_type == "cuda":
                 torch.cuda.current_stream().synchronize()
-            elif self.models_processor.device != "cpu":
+            elif self.models_processor.device_type != "cpu":
                 self.models_processor.syncvec.cpu()
 
             ort_session.run_with_iobinding(io_binding)
@@ -1297,16 +1297,16 @@ class FaceMasks:
         io_binding = ort_session.io_binding()
         io_binding.bind_input(
             name="in_face:0",
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=image.size(),
             buffer_ptr=image.data_ptr(),
         )
         io_binding.bind_output(
             name="out_mask:0",
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=(1, 1, 256, 256),
             buffer_ptr=output.data_ptr(),
@@ -1321,9 +1321,9 @@ class FaceMasks:
 
         try:
             # PRE-INFERENCE SYNC
-            if self.models_processor.device == "cuda":
+            if self.models_processor.device_type == "cuda":
                 torch.cuda.current_stream().synchronize()
-            elif self.models_processor.device != "cpu":
+            elif self.models_processor.device_type != "cpu":
                 self.models_processor.syncvec.cpu()
 
             ort_session.run_with_iobinding(io_binding)
@@ -1350,16 +1350,16 @@ class FaceMasks:
 
         io_binding.bind_input(
             name=input_name,
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=image_tensor.shape,
             buffer_ptr=image_tensor.data_ptr(),
         )
         io_binding.bind_output(
             name=output_name,
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=output_tensor.shape,
             buffer_ptr=output_tensor.data_ptr(),
@@ -1374,9 +1374,9 @@ class FaceMasks:
 
         try:
             # PRE-INFERENCE SYNC
-            if self.models_processor.device == "cuda":
+            if self.models_processor.device_type == "cuda":
                 torch.cuda.current_stream().synchronize()
-            elif self.models_processor.device != "cpu":
+            elif self.models_processor.device_type != "cpu":
                 self.models_processor.syncvec.cpu()
 
             sess.run_with_iobinding(io_binding)
