@@ -80,6 +80,7 @@ class FrameEdits:
         # for the RAM-to-VRAM transfer to complete via the PCIe bus.
         M_c2o_tensor = (
             torch.from_numpy(M_c2o)
+            .pin_memory()
             .float()
             .unsqueeze(0)
             .to(out.device, non_blocking=True)
@@ -137,7 +138,7 @@ class FrameEdits:
             else contextlib.nullcontext()
         )
 
-        with stream_context:
+        with stream_context, torch.inference_mode():
             # --- CONFIGURATION ---
             use_mean_eyes = parameters.get("LandmarkMeanEyesToggle", False)
             # Sanitized Mode Selection
@@ -294,10 +295,12 @@ class FrameEdits:
             t_anchor[..., 2].fill_(0)
             scale_anchor = x_s_info["scale"]
 
-            # Load Lip Array (Neutral reference for lips)
-            lp_lip_array = torch.from_numpy(self.models_processor.lp_lip_array).to(
-                dtype=torch.float32, device=self.models_processor.device
-            )
+            # Only send to GPU once by checking if it's already a tensor in the central processor.
+            if not hasattr(self, "_cached_lp_lip_tensor"):
+                self._cached_lp_lip_tensor = torch.from_numpy(self.models_processor.lp_lip_array).to(
+                    dtype=torch.float32, device=self.models_processor.device
+                )
+            lp_lip_array = self._cached_lp_lip_tensor
 
             # --- SHARED HELPER FUNCTION ---
             def get_component_motion(
@@ -908,10 +911,6 @@ class FrameEdits:
             out = self._apply_kornia_warp(out, M_c2o, dsize)
             out = out.mul_(255.0).clamp_(0, 255)
 
-        # Sync the stream safely
-        if local_stream:
-            local_stream.synchronize()
-
         return out.type(torch.float32)
 
     def swap_edit_face_core(
@@ -956,7 +955,7 @@ class FrameEdits:
                 else contextlib.nullcontext()
             )
 
-            with stream_context:
+            with stream_context, torch.inference_mode():
                 init_source_eye_ratio = 0.0
                 init_source_lip_ratio = 0.0
 
@@ -1179,10 +1178,6 @@ class FrameEdits:
 
                 img = out
                 img = img.mul_(255.0).clamp_(0, 255).type(torch.float32)
-
-            # Sync the stream safely
-            if local_stream:
-                local_stream.synchronize()
 
         return img
 
