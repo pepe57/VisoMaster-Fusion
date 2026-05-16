@@ -573,6 +573,9 @@ class ModelsProcessor(QtCore.QObject):
             onnx_path (str): The local path to the ONNX model.
             trt_options (dict): The TensorRT options containing the dynamic cache path.
         """
+        import os
+        import re
+
         cache_dir = trt_options.get("trt_engine_cache_path", "tensorrt-engines")
         base_onnx_name = os.path.splitext(os.path.basename(onnx_path))[0]
 
@@ -592,9 +595,7 @@ class ModelsProcessor(QtCore.QObject):
                     engine_name = match.group(0).decode("utf-8")
 
                     # Failsafe: ORT pathing behavior varies.
-                    # It sometimes nests the engine, sometimes puts it at the root of the cache dir.
                     engine_subdirectory_name = os.path.basename(cache_dir)
-
                     engine_file_paths_to_check.extend(
                         [
                             os.path.join(cache_dir, engine_name),
@@ -635,22 +636,44 @@ class ModelsProcessor(QtCore.QObject):
                 except Exception as e:
                     print(f"[WARN] Failed to delete engine file {engine_path}: {e}")
 
-        # 4. Delete any associated timing cache or profile files starting with the base name
+        # 4. Delete any associated timing cache, profile files, or general cache files
         if os.path.exists(cache_dir) and os.path.isdir(cache_dir):
             try:
                 for file_name in os.listdir(cache_dir):
-                    # Catch both .profile files and any model-specific .cache files
-                    if file_name.startswith(base_onnx_name) and (
-                        file_name.endswith(".profile") or file_name.endswith(".cache")
-                    ):
-                        profile_path = os.path.join(cache_dir, file_name)
-                        if os.path.isfile(profile_path):
-                            os.remove(profile_path)
-                            print(
-                                f"[INFO] Deleted TensorRT auxiliary file: {profile_path}"
-                            )
+                    # Catch model-specific files (e.g., SomeModel.profile)
+                    is_model_specific = file_name.startswith(base_onnx_name) and (
+                        file_name.endswith(".profile")
+                        or file_name.endswith(".cache")
+                        or file_name.endswith(".timing")
+                    )
+
+                    # Catch exact generic names (like DFM's "timing.cache")
+                    is_generic_timing = file_name == "timing.cache"
+
+                    # Catch ORT's global architecture-based timing caches
+                    # Example: TensorrtExecutionProvider_cache_sm120.timing
+                    is_ort_global_timing = file_name.startswith(
+                        "TensorrtExecutionProvider_"
+                    ) and (
+                        file_name.endswith(".timing") or file_name.endswith(".profile")
+                    )
+
+                    if is_model_specific or is_generic_timing or is_ort_global_timing:
+                        target_path = os.path.join(cache_dir, file_name)
+                        if os.path.isfile(target_path):
+                            try:
+                                os.remove(target_path)
+                                print(
+                                    f"[INFO] Deleted TensorRT auxiliary/timing file: {target_path}"
+                                )
+                            except Exception as e:
+                                print(
+                                    f"[WARN] Failed to delete auxiliary file {target_path}: {e}"
+                                )
             except Exception as e:
-                print(f"[WARN] Failed to clean profile/cache files in {cache_dir}: {e}")
+                print(
+                    f"[WARN] Failed to clean profile/timing/cache files in {cache_dir}: {e}"
+                )
 
     def load_model(self, model_name, session_options=None):
         """

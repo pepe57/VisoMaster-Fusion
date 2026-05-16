@@ -297,9 +297,9 @@ class FrameEdits:
 
             # Only send to GPU once by checking if it's already a tensor in the central processor.
             if not hasattr(self, "_cached_lp_lip_tensor"):
-                self._cached_lp_lip_tensor = torch.from_numpy(self.models_processor.lp_lip_array).to(
-                    dtype=torch.float32, device=self.models_processor.device
-                )
+                self._cached_lp_lip_tensor = torch.from_numpy(
+                    self.models_processor.lp_lip_array
+                ).to(dtype=torch.float32, device=self.models_processor.device)
             lp_lip_array = self._cached_lp_lip_tensor
 
             # --- SHARED HELPER FUNCTION ---
