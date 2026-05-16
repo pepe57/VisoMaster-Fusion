@@ -301,71 +301,132 @@ class FrameEdits:
 
             # --- SHARED HELPER FUNCTION ---
             def get_component_motion(
-                indices,
-                driving_exp,
-                multiplier,
-                extra_delta=0,
-                is_relative=False,
-                neutral_ref=None,
-                use_boost=False,
-            ):
+                indices: list[int],
+                driving_exp: torch.Tensor,
+                multiplier: float,
+                extra_delta: torch.Tensor | int | float = 0,
+                is_relative: bool = False,
+                neutral_ref: torch.Tensor | int | None = None,
+                use_boost: bool = False,
+            ) -> torch.Tensor:
                 """
                 Helper to calculate motion with 'Smart Dynamic Boost' and 'Neutral Factor'.
-                Refactored to solve Gaze Drift and Eyelid Jitter globally.
+                Encapsulates Z-Axis Gaze Lock with Automated Perceptual Pitch Compensation.
                 """
                 delta_local = x_s_info["exp"].clone()
+                force_camera_gaze = parameters.get(
+                    "FaceExpressionCameraGazeToggle", False
+                )
 
                 if is_relative:
-                    # Relative Motion Calculation
                     ref = neutral_ref if neutral_ref is not None else 0
                     if isinstance(ref, torch.Tensor) and ref.shape[-2] == 21:
                         ref_part = ref[..., indices, :]
                     else:
                         ref_part = ref
 
-                    # Calculate the raw difference (motion intent)
                     raw_diff = driving_exp[:, indices, :] - ref_part
 
-                    # --- SMART DYNAMIC BOOST (Fixed Jitter) ---
+                    # --- SMART DYNAMIC BOOST ---
                     boost_val = micro_expression_boost if use_boost else 1.0
-
                     if use_boost and boost_val > 1.0:
                         magnitude = torch.abs(raw_diff)
-
-                        # 1. Decay: Prevents distortion on strong/large expressions
                         decay = torch.exp(-10.0 * magnitude)
-
-                        # 2. Noise Gate : Prevents boosting microscopic tracking noise.
-                        # Ramps up from 0 to 1 between 0.000 and 0.005 magnitude.
-                        # This stops the high-frequency eyelid trembling.
                         noise_gate = torch.clamp(magnitude / 0.005, 0.0, 1.0)
-
                         dynamic_scale = 1.0 + (boost_val - 1.0) * decay * noise_gate
                         diff = raw_diff * dynamic_scale
                     else:
                         diff = raw_diff * boost_val
 
-                    # --- NEUTRAL FACTOR (Anti-Surenchère) ---
+                    # --- NEUTRAL FACTOR ---
                     diff = diff * neutral_factor
 
                     delta_local[:, indices, :] = x_s_info["exp"][:, indices, :] + diff
 
-                    # --- GLOBAL GAZE STABILIZATION (X-AXIS) ---
-                    # 11 and 15 are the explicit latent indices controlling the horizontal iris position
+                    # --- GAZE STABILIZATION PIPELINE ---
                     if 11 in indices and 15 in indices:
-                        gaze_dampening = (
-                            0.50  # Dampen horizontal motion to preserve native IPD
-                        )
                         idx_11, idx_15 = indices.index(11), indices.index(15)
-                        delta_local[:, 11, 0] = x_s_info["exp"][:, 11, 0] + (
-                            diff[:, idx_11, 0] * gaze_dampening
-                        )
-                        delta_local[:, 15, 0] = x_s_info["exp"][:, 15, 0] + (
-                            diff[:, idx_15, 0] * gaze_dampening
-                        )
+
+                        if force_camera_gaze:
+                            import math
+
+                            # 1. 3D Z-Axis Projection (Mona Lisa Effect)
+                            cam_world = torch.tensor(
+                                [0.0, 0.0, 1.0],
+                                dtype=torch.float32,
+                                device=delta_local.device,
+                            )
+                            R_inv = R_anchor.squeeze(0).transpose(0, 1)
+                            cam_local = torch.matmul(R_inv, cam_world)
+
+                            # 2. Fetch UI Parameters
+                            strength = parameters.get(
+                                "FaceExpressionCameraGazeStrengthDecimalSlider", 0.50
+                            )
+                            vertical_offset_ui = parameters.get(
+                                "FaceExpressionCameraGazeVerticalOffsetDecimalSlider",
+                                0.0,
+                            )
+
+                            # 3. DYNAMIC PERCEPTUAL COMPENSATION (Auto-Offset for Video)
+                            # Extract the real-time head pitch to evaluate chin elevation.
+                            head_pitch_deg = faceutil.headpose_pred_to_degree(
+                                x_s_info["pitch"]
+                            ).item()
+
+                            # We dynamically shift the gaze down when the chin is down, and up when chin is up.
+                            # -0.0005 is the empirical constant mapping physical degrees to latent sclera occlusion.
+                            auto_perceptual_offset = head_pitch_deg * -0.0005 * strength
+
+                            # 4. Raw Latent Shift Calculation
+                            raw_gaze_x = cam_local[0].item() * 0.035 * strength
+
+                            # Mathematically compute the 3D target, add the AUTO offset, and add the MANUAL fallback
+                            raw_gaze_y = (
+                                (cam_local[1].item() * 0.020 * strength)
+                                + auto_perceptual_offset
+                                + (vertical_offset_ui * 0.015)
+                            )
+
+                            # 5. SELECTIVE SOFT CLAMPING (Safety Shield)
+                            safe_gaze_x = (
+                                0.040 * math.tanh(raw_gaze_x / 0.040)
+                                if raw_gaze_x != 0
+                                else 0.0
+                            )
+                            safe_gaze_y = (
+                                0.020 * math.tanh(raw_gaze_y / 0.020)
+                                if raw_gaze_y != 0
+                                else 0.0
+                            )
+
+                            # 6. Horizontal Overwrite & Vertical Safe Addition
+                            delta_local[:, 11, 0] = safe_gaze_x
+                            delta_local[:, 15, 0] = safe_gaze_x
+
+                            delta_local[:, 11, 1] = (
+                                x_s_info["exp"][:, 11, 1]
+                                + diff[:, idx_11, 1]
+                                + safe_gaze_y
+                            )
+                            delta_local[:, 15, 1] = (
+                                x_s_info["exp"][:, 15, 1]
+                                + diff[:, idx_15, 1]
+                                + safe_gaze_y
+                            )
+
+                        else:
+                            # Standard Dampening
+                            gaze_dampening = 0.50
+                            delta_local[:, 11, 0] = x_s_info["exp"][:, 11, 0] + (
+                                diff[:, idx_11, 0] * gaze_dampening
+                            )
+                            delta_local[:, 15, 0] = x_s_info["exp"][:, 15, 0] + (
+                                diff[:, idx_15, 0] * gaze_dampening
+                            )
 
                 else:
-                    # Absolute Motion
+                    # Absolute Motion Calculation
                     target_exp = driving_exp[:, indices, :]
                     current_exp = x_s_info["exp"][:, indices, :]
 
@@ -373,22 +434,74 @@ class FrameEdits:
                         current_exp * (1 - neutral_factor) + target_exp * neutral_factor
                     )
 
-                    # --- GLOBAL GAZE STABILIZATION (X-AXIS) ---
+                    # --- GAZE STABILIZATION PIPELINE (Absolute Mode) ---
                     if 11 in indices and 15 in indices:
                         idx_11, idx_15 = indices.index(11), indices.index(15)
-                        gaze_x_blend = (
-                            0.60  # Blend absolute X with the target's native X
-                        )
-                        delta_local[:, 11, 0] = torch.lerp(
-                            current_exp[:, idx_11, 0],
-                            target_exp[:, idx_11, 0],
-                            gaze_x_blend,
-                        )
-                        delta_local[:, 15, 0] = torch.lerp(
-                            current_exp[:, idx_15, 0],
-                            target_exp[:, idx_15, 0],
-                            gaze_x_blend,
-                        )
+
+                        if force_camera_gaze:
+                            import math
+
+                            cam_world = torch.tensor(
+                                [0.0, 0.0, 1.0],
+                                dtype=torch.float32,
+                                device=delta_local.device,
+                            )
+                            R_inv = R_anchor.squeeze(0).transpose(0, 1)
+                            cam_local = torch.matmul(R_inv, cam_world)
+
+                            strength = parameters.get(
+                                "FaceExpressionCameraGazeStrengthDecimalSlider", 0.50
+                            )
+                            vertical_offset_ui = parameters.get(
+                                "FaceExpressionCameraGazeVerticalOffsetDecimalSlider",
+                                0.0,
+                            )
+
+                            # Dynamic Perceptual Compensation (Absolute Mode)
+                            head_pitch_deg = faceutil.headpose_pred_to_degree(
+                                x_s_info["pitch"]
+                            ).item()
+                            auto_perceptual_offset = head_pitch_deg * -0.0005 * strength
+
+                            raw_gaze_x = cam_local[0].item() * 0.035 * strength
+                            raw_gaze_y = (
+                                (cam_local[1].item() * 0.020 * strength)
+                                + auto_perceptual_offset
+                                + (vertical_offset_ui * 0.015)
+                            )
+
+                            # Selective Soft Clamping
+                            safe_gaze_x = (
+                                0.040 * math.tanh(raw_gaze_x / 0.040)
+                                if raw_gaze_x != 0
+                                else 0.0
+                            )
+                            safe_gaze_y = (
+                                0.020 * math.tanh(raw_gaze_y / 0.020)
+                                if raw_gaze_y != 0
+                                else 0.0
+                            )
+
+                            # Absolute Overwrite & Safe Addition
+                            delta_local[:, 11, 0] = safe_gaze_x
+                            delta_local[:, 15, 0] = safe_gaze_x
+
+                            delta_local[:, 11, 1] = delta_local[:, 11, 1] + safe_gaze_y
+                            delta_local[:, 15, 1] = delta_local[:, 15, 1] + safe_gaze_y
+
+                        else:
+                            # Standard Blend
+                            gaze_x_blend = 0.60
+                            delta_local[:, 11, 0] = torch.lerp(
+                                current_exp[:, idx_11, 0],
+                                target_exp[:, idx_11, 0],
+                                gaze_x_blend,
+                            )
+                            delta_local[:, 15, 0] = torch.lerp(
+                                current_exp[:, idx_15, 0],
+                                target_exp[:, idx_15, 0],
+                                gaze_x_blend,
+                            )
 
                 # Projection & Refinement
                 x_proj = scale_anchor * (x_c_s @ R_anchor + delta_local) + t_anchor
