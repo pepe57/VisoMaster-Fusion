@@ -1501,7 +1501,7 @@ class VideoProcessor(QObject):
                     else 0
                 )
                 if src_frame_count > 0 and duration_sec > 0:
-                    output_frames = max(1, int(duration_sec * self.fps))
+                    output_frames = max(1, int(round(duration_sec * self.fps)))
                     self.max_frame_number = output_frames - 1
                     # Slider stays in source frame space (approach 2); no setMaximum needed.
                 else:
@@ -1511,6 +1511,7 @@ class VideoProcessor(QObject):
                         f"recording_source_fps={self.recording_source_fps}). "
                         "Disabling FPS-cap input path and falling back to source FPS."
                     )
+                    self._used_ffmpeg_cap = False
                     self.fps = self.recording_source_fps
         else:
             self._used_ffmpeg_cap = False
@@ -2146,7 +2147,6 @@ class VideoProcessor(QObject):
             self._cancel_single_frame_preview_state()
             self._clear_single_frame_preview_caches()
             self._stop_recording_ffmpeg_input_stream()
-            self._used_ffmpeg_cap = False
             if self.file_type == "video" and self.media_path:
                 if not self.media_capture or not self.media_capture.isOpened():
                     print(
@@ -2260,16 +2260,13 @@ class VideoProcessor(QObject):
         if self.file_type == "video" and self.media_path:
             last_processed = self.next_frame_to_display - 1
             start_frame = getattr(self, "processing_start_frame", 0)
-            current_slider_pos = max(start_frame, last_processed)
-            current_slider_pos = min(current_slider_pos, self.max_frame_number)
-            # Slider stays in source frame space (approach 2).
-            # If FPS-cap recording was active, map output frame �?source frame before seek.
-            src_slider_max = self.main_window.videoSeekSlider.maximum()
             if self._used_ffmpeg_cap and self.fps > 0 and self.recording_source_fps > 0:
-                current_slider_pos = min(
-                    self.output_to_source_frame(current_slider_pos),
-                    src_slider_max,
-                )
+                last_processed = self.output_to_source_frame(last_processed)
+            current_slider_pos = max(start_frame, last_processed)
+            # Slider stays in source frame space (approach 2).
+            # If FPS-cap recording was active, map output frame -> source frame before seek.
+            src_slider_max = self.main_window.videoSeekSlider.maximum()
+            current_slider_pos = min(current_slider_pos, src_slider_max)
             if self._reopen_video_capture(current_slider_pos):
                 # Restore max_frame_number/fps to source space after FPS-cap recording.
                 if was_recording_default_style:
@@ -4255,16 +4252,13 @@ class VideoProcessor(QObject):
             if self.file_type == "video" and self.media_path:
                 last_processed = self.next_frame_to_display - 1
                 start_frame = getattr(self, "processing_start_frame", 0)
-                reset_frame = max(start_frame, last_processed)
-                reset_frame = min(reset_frame, self.max_frame_number)
-                # Slider stays in source frame space (approach 2).
-                # If FPS-cap recording was active, map output frame �?source frame before seek.
-                src_slider_max = self.main_window.videoSeekSlider.maximum()
                 if self._used_ffmpeg_cap and self.fps > 0 and self.recording_source_fps > 0:
-                    reset_frame = min(
-                        self.output_to_source_frame(reset_frame),
-                        src_slider_max,
-                    )
+                    last_processed = self.output_to_source_frame(last_processed)
+                reset_frame = max(start_frame, last_processed)
+                # Slider stays in source frame space (approach 2).
+                # If FPS-cap recording was active, map output frame -> source frame before seek.
+                src_slider_max = self.main_window.videoSeekSlider.maximum()
+                reset_frame = min(reset_frame, src_slider_max)
 
                 if self._reopen_video_capture(reset_frame):
                     # Restore max_frame_number/fps to source space after FPS-cap recording.
