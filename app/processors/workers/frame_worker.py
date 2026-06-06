@@ -4305,9 +4305,6 @@ class FrameWorker(threading.Thread):
             raw_kps_crop = tform(kps_203)
             kps_all_crop = np.array(raw_kps_crop, dtype=np.float32)
 
-        # STATE TRACKER: Suit si le tenseur 'swap' a subi une modification géométrique
-        is_geometry_altered = False
-
         # FW-PERF-5: use promoted instance-attribute transforms (initialized in
         # set_scaling_transforms) instead of constructing new objects each call
         t512_mask = self.t512_mask
@@ -4518,9 +4515,7 @@ class FrameWorker(threading.Thread):
                 cast(dict, parameters),
                 cast(dict, control),
                 driving_kps=kps_all_crop,
-                target_kps=None if is_geometry_altered else kps_all_crop,
             )
-            is_geometry_altered = True
 
         # Face editor beginning
         if (
@@ -4541,9 +4536,7 @@ class FrameWorker(threading.Thread):
                 swap,
                 parameters,
                 control,
-                kps_all=None if is_geometry_altered else kps_all_crop,
             )
-            is_geometry_altered = True
 
         # First Denoiser pass - Before Restorers
         if control.get("DenoiserUNetEnableBeforeRestorersToggle", False):
@@ -4909,9 +4902,7 @@ class FrameWorker(threading.Thread):
                 cast(dict, parameters),
                 cast(dict, control),
                 driving_kps=kps_all_crop,
-                target_kps=None if is_geometry_altered else kps_all_crop,
             )
-            is_geometry_altered = True
 
         # Face Editor (After First)
         if (
@@ -4932,9 +4923,8 @@ class FrameWorker(threading.Thread):
                 swap_restorecalc,
                 parameters,
                 control,
-                kps_all=None if is_geometry_altered else kps_all_crop,
             )
-            is_geometry_altered = True
+
             if swap_mask_noFP.shape[-1] != swap.shape[-1]:
                 swap_mask = v2.Resize((swap.shape[-2], swap.shape[-1]), antialias=True)(
                     swap_mask_noFP
@@ -4997,9 +4987,7 @@ class FrameWorker(threading.Thread):
                 cast(dict, parameters),
                 cast(dict, control),
                 driving_kps=kps_all_crop,
-                target_kps=None if is_geometry_altered else kps_all_crop,
             )
-            is_geometry_altered = True
 
         # Editor (After Second)
         if (
@@ -5020,9 +5008,8 @@ class FrameWorker(threading.Thread):
                 swap,
                 parameters,
                 control,
-                kps_all=None if is_geometry_altered else kps_all_crop,
             )
-            is_geometry_altered = True
+
             if swap_mask_noFP.shape[-1] != swap.shape[-1]:
                 swap_mask = v2.Resize((swap.shape[-2], swap.shape[-1]), antialias=True)(
                     swap_mask_noFP
@@ -5371,9 +5358,7 @@ class FrameWorker(threading.Thread):
                 swap,
                 parameters,
                 control,
-                kps_all=None if is_geometry_altered else kps_all_crop,
             )
-            is_geometry_altered = True
 
             if swap_mask_noFP.shape[-1] != swap.shape[-1]:
                 swap_mask = v2.Resize((swap.shape[-2], swap.shape[-1]), antialias=True)(

@@ -110,7 +110,7 @@ def set_up_video_seek_line_edit(main_window: "MainWindow"):
 
 def update_video_time_line_edit(
     main_window: "MainWindow", current_frame_number: int | None = None
-):
+) -> None:
     video_time_line_edit = getattr(main_window, "videoTimeLineEdit", None)
     if video_time_line_edit is None:
         return
@@ -121,23 +121,27 @@ def update_video_time_line_edit(
         )
 
     fps = float(getattr(main_window.video_processor, "fps", 0.0) or 0.0)
+
     # When FPS-cap recording is active, the slider and UI are in source-frame
     # space (Approach 2). Use the source FPS for time calculations to avoid
     # inflating displayed time when an output FPS cap is lower than the
     # original source FPS.
     vp = getattr(main_window, "video_processor", None)
-    source_fps = None
+
+    # Initialize as float to guarantee type stability for downstream math and logic
+    source_fps: float = 0.0
     if vp is not None:
         source_fps = float(getattr(vp, "recording_source_fps", 0.0) or 0.0)
 
-    if getattr(vp, "_used_ffmpeg_cap", False) and source_fps > 0:
+    if getattr(vp, "_used_ffmpeg_cap", False) and source_fps > 0.0:
         fps_to_use = source_fps
     else:
         fps_to_use = fps
 
     total_seconds = (
-        max(0.0, float(current_frame_number) / fps_to_use) if fps_to_use > 0 else 0.0
+        max(0.0, float(current_frame_number) / fps_to_use) if fps_to_use > 0.0 else 0.0
     )
+
     minutes = int(total_seconds // 60)
     seconds = int(total_seconds % 60)
     video_time_line_edit.setText(f"{minutes:02d}:{seconds:02d}")
