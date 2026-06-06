@@ -93,6 +93,7 @@ class TwoLineElidedLabel(QtWidgets.QLabel):
         )
         super().setText(f"{first_line}\n{second_line}")
 
+
 class CardButton(QPushButton):
     def __init__(self, *args, **kwargs):
         self.main_window = kwargs.pop("main_window", None)
