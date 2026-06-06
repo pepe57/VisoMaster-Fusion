@@ -159,7 +159,7 @@ class FrameEdits:
                     bbox=np.array([0, 0, 512, 512]),
                     det_kpss=[],
                     detect_mode="203",
-                    score=0.45,
+                    score=0.5,
                     from_points=False,
                     use_mean_eyes=use_mean_eyes,
                 )
@@ -211,7 +211,7 @@ class FrameEdits:
                 bbox=np.array([0, 0, 512, 512], dtype=np.float32),
                 det_kpss=None,
                 detect_mode="203",
-                score=0.45,
+                score=0.5,
                 from_points=False,
                 use_mean_eyes=use_mean_eyes,
             )
@@ -314,6 +314,11 @@ class FrameEdits:
                 force_camera_gaze = parameters.get(
                     "FaceExpressionCameraGazeToggle", False
                 )
+
+                # If we dampen the expression towards neutral, the retargeting offsets (extra_delta)
+                # must be strictly dampened by the same ratio to prevent decoupled floating features.
+                if isinstance(extra_delta, torch.Tensor) or extra_delta != 0:
+                    extra_delta = extra_delta * neutral_factor
 
                 # 1. COMPUTE BASE EXPRESSION DELTA (Relative or Absolute)
                 if is_relative:
@@ -939,7 +944,7 @@ class FrameEdits:
                     bbox=np.array([0, 0, 512, 512]),
                     det_kpss=[],
                     detect_mode="203",
-                    score=0.45,
+                    score=0.5,
                     from_points=False,
                     use_mean_eyes=use_mean_eyes,
                 )
