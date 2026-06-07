@@ -391,8 +391,9 @@ def add_video_slider_marker(main_window: "MainWindow"):
             main_window.videoSeekSlider,
         )
         return
+
     current_position = int(main_window.videoSeekSlider.value())
-    # print("current_position", current_position)
+
     if not main_window.target_faces:
         common_widget_actions.create_and_show_messagebox(
             main_window,
@@ -408,10 +409,12 @@ def add_video_slider_marker(main_window: "MainWindow"):
             main_window.videoSeekSlider,
         )
     else:
+        # FIX: Deepcopy both parameters and control to guarantee total memory
+        # isolation and prevent state bleeding across timeline boundaries.
         add_marker(
             main_window,
             copy.deepcopy(main_window.parameters),
-            main_window.control.copy(),
+            copy.deepcopy(main_window.control),
             current_position,
         )
 
