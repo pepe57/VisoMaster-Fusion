@@ -5089,8 +5089,9 @@ class FrameWorker(threading.Thread):
                 swap = faceutil.apply_adain_color_transfer(
                     swap,
                     original_face_for_color,
-                    mask_autocolor,
+                    swap_mask,
                     parameters["AutoColorBlendAmountSlider"],
+                    calc_mask=mask_autocolor,
                 )
 
         # --- TRANSFER TEXTURE ---
@@ -5550,8 +5551,9 @@ class FrameWorker(threading.Thread):
                 swap = faceutil.apply_adain_color_transfer(
                     swap,
                     original_face_512,
-                    mask_autocolor_end,
+                    swap_mask,
                     parameters["EndingColorBlendAmountSlider"],
+                    calc_mask=mask_autocolor_end,
                 )
 
         # Third denoiser pass - After all restorations, colour corrections and ending colour transfer.
