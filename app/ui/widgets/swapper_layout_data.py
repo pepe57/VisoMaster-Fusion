@@ -165,6 +165,18 @@ SWAPPER_LAYOUT_DATA: Any = {  # noqa: F811
             "requiredToggleValue": True,
             "help": "Determines the factor of likeness between the source and assigned faces.",
         },
+        "FaceLikenessStrengthDecimalSlider": {
+            "level": 2,
+            "label": "Volumetric Strength",
+            "min_value": "1.00",
+            "max_value": "1.50",
+            "default": "1.00",
+            "decimals": 2,
+            "step": 0.01,
+            "parentToggle": "FaceLikenessEnableToggle",
+            "requiredToggleValue": True,
+            "help": "Determines the strength of the likeness factor.",
+        },
         "FaceKeypointsReplaceEnableToggle": {
             "level": 1,
             "label": "Face Keypoints Replacer",
