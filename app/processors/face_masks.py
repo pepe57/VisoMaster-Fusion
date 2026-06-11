@@ -330,17 +330,28 @@ class FaceMasks:
         y_o_full, x_o_full = torch.where(mouth_orig)
         y_s_full, x_s_full = torch.where(mouth_swap)
 
-        # 1. SCALE (Width Standard Deviation)
-        # Width is calculated based on spatial dispersion. Even if the mask jitters,
-        # the scale factor will remain completely stable over time.
-        std_x_o = x_o_full.float().std()
-        std_x_s = x_s_full.float().std()
+        # Isolate strictly the Inner Cavity for precise cavity-to-cavity scaling
+        y_o_inner, x_o_inner = torch.where(inner_orig)
+        y_s_inner, x_s_inner = torch.where(inner_swap)
+
+        # 1. SCALE (Inner Cavity Standard Deviation)
+        # Calculate width based STRICTLY on the inner cavity (Class 11).
+
+        std_x_o = x_o_inner.float().std()
+        std_x_s = x_s_inner.float().std()
+
+        std_y_o = y_o_inner.float().std()
+        std_y_s = y_s_inner.float().std()
 
         if (
             std_x_o <= 0.0
             or std_x_s <= 0.0
             or torch.isnan(std_x_o)
             or torch.isnan(std_x_s)
+            or std_y_o <= 0.0
+            or std_y_s <= 0.0
+            or torch.isnan(std_y_o)
+            or torch.isnan(std_y_s)
         ):
             return None, None
 
