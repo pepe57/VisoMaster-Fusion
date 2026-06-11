@@ -3495,6 +3495,9 @@ class FrameWorker(threading.Thread):
             _use_batched = False
 
             for k in range(itex):
+                # Double Buffering: Update previous state reference before current pass
+                prev_face = input_face_affined
+
                 if _use_batched:
                     # ------ BATCHED PATH (dim > 1) ------
                     tiles_list = []
@@ -3604,6 +3607,7 @@ class FrameWorker(threading.Thread):
             dim_res = dim // 2
 
             for k in range(itex):
+                prev_face = input_face_affined
                 temp_output = input_face_affined.clone()
 
                 tile_inputs = []
@@ -3655,6 +3659,9 @@ class FrameWorker(threading.Thread):
         # --- SimSwap Path ---
         elif swapper_model == "SimSwap512":
             for k in range(itex):
+                # Zero-clone optimization: Model generates a fresh tensor
+                prev_face = input_face_affined
+
                 input_face_disc = (
                     input_face_affined.permute(2, 0, 1).unsqueeze(0).contiguous()
                 )
@@ -3693,6 +3700,9 @@ class FrameWorker(threading.Thread):
         # --- GhostFace Path ---
         elif swapper_model in self.GHOSTFACE_MODELS:
             for k in range(itex):
+                # Performance Optimization: Avoiding redundant VRAM allocations
+                prev_face = input_face_affined
+
                 # Model-specific preprocessing (Normalizing to [-1, 1])
                 input_face_disc = torch.mul(input_face_affined, 255.0).permute(2, 0, 1)
                 input_face_disc = torch.div(input_face_disc.float(), 127.5)
@@ -3745,6 +3755,8 @@ class FrameWorker(threading.Thread):
         # --- CSCS Path ---
         elif swapper_model == "CSCS":
             for k in range(itex):
+                prev_face = input_face_affined
+
                 input_face_disc = input_face_affined.permute(2, 0, 1)
                 input_face_disc = v2.functional.normalize(
                     input_face_disc, (0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=False
