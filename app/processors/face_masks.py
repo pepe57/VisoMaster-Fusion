@@ -1313,12 +1313,6 @@ class FaceMasks:
         outpred = 1.0 - outpred
         outpred = torch.unsqueeze(outpred, 0).type(torch.float32)
 
-        outpred_calc = torch.where(outpred_calc < 0.1, 0.0, 1.0).float()
-        outpred_calc = 1.0 - outpred_calc
-        outpred_calc = torch.unsqueeze(outpred_calc, 0).type(torch.float32)
-
-        outpred_calc_dill = outpred_calc.clone()
-
         if amount2 != amount:
             outpred2 = outpred.clone()
 
@@ -1403,6 +1397,10 @@ class FaceMasks:
                 outpred = 1.0 - outpred
                 outpred = outpred.clamp(0.0, 1.0)
 
+        # Derive calculation masks AFTER size processing, but BEFORE blur.
+        # This ensures color stats never sample excluded background pixels.
+        outpred_calc = torch.where(outpred < 0.5, 0.0, 1.0).float()
+        outpred_calc_dill = outpred_calc.clone()
         blur_amount = parameters.get("OccluderXSegBlurSlider", 0)
         if blur_amount > 0:
             k_size = blur_amount * 2 + 1

@@ -4859,6 +4859,20 @@ class FrameWorker(threading.Thread):
                     antialias=True,
                 )(swap_mask_noFP)
 
+            # --- START FIX: BORDER BLUR ALIGNMENT ---
+            # The standard Occluder blurs the global swap_mask, softening the harsh
+            # border_mask edges. DFLXSeg blurs its mask internally, leaving the base
+            # swap_mask edges razor-sharp. We apply the blur here to soften the boundaries
+            # BEFORE multiplying XSeg, avoiding double-blurring the XSeg internal edges.
+            if not parameters.get("OccluderEnableToggle", False):
+                blur_amount = parameters.get("OccluderXSegBlurSlider", 0)
+                if blur_amount > 0:
+                    kernel_size = blur_amount * 2 + 1
+                    sigma = (blur_amount + 1) * 0.2
+                    gauss_op = v2.GaussianBlur(kernel_size, sigma)
+                    swap_mask = gauss_op(swap_mask)
+                    swap_mask_noFP = gauss_op(swap_mask_noFP)
+            # --- END FIX ---
             # apply_dfl_xseg returns inverted masks (0=Face, 1=BG).
             # We multiply by (1 - mask) to carve out the background.
             swap_mask_noFP.mul_(1.0 - outpred_noFP_res)
