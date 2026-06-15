@@ -4572,16 +4572,26 @@ class FrameWorker(threading.Thread):
                 or parameters["FaceExpressionBrowsToggle"]
                 or parameters["FaceExpressionGeneralToggle"]
                 or parameters.get("FaceExpressionModeSelection", "Advanced") == "Simple"
+                or parameters.get("FaceExpressionModeSelection", "Advanced") == "Recast"
             )
             and parameters["FaceExpressionBeforeTypeSelection"] == "Beginning"
         ):
-            swap = self.frame_edits.apply_face_expression_restorer(
-                original_face_512,
-                swap,
-                cast(dict, parameters),
-                cast(dict, control),
-                driving_kps=kps_all_crop,
-            )
+            if parameters.get("FaceExpressionModeSelection", "Advanced") == "Recast":
+                swap = self.frame_edits.apply_perform_recast(
+                    original_face_512,
+                    swap,
+                    cast(dict, parameters),
+                    cast(dict, control),
+                    driving_kps=kps_all_crop,
+                )
+            else:
+                swap = self.frame_edits.apply_face_expression_restorer(
+                    original_face_512,
+                    swap,
+                    cast(dict, parameters),
+                    cast(dict, control),
+                    driving_kps=kps_all_crop,
+                )
 
         # Face editor beginning
         if (
@@ -4972,17 +4982,27 @@ class FrameWorker(threading.Thread):
                 or parameters["FaceExpressionBrowsToggle"]
                 or parameters["FaceExpressionGeneralToggle"]
                 or parameters.get("FaceExpressionModeSelection", "Advanced") == "Simple"
+                or parameters.get("FaceExpressionModeSelection", "Advanced") == "Recast"
             )
             and parameters["FaceExpressionBeforeTypeSelection"]
             == "After First Restorer"
         ):
-            swap = self.frame_edits.apply_face_expression_restorer(
-                original_face_512,
-                swap,
-                cast(dict, parameters),
-                cast(dict, control),
-                driving_kps=kps_all_crop,
-            )
+            if parameters.get("FaceExpressionModeSelection", "Advanced") == "Recast":
+                swap = self.frame_edits.apply_perform_recast(
+                    original_face_512,
+                    swap,
+                    cast(dict, parameters),
+                    cast(dict, control),
+                    driving_kps=kps_all_crop,
+                )
+            else:
+                swap = self.frame_edits.apply_face_expression_restorer(
+                    original_face_512,
+                    swap,
+                    cast(dict, parameters),
+                    cast(dict, control),
+                    driving_kps=kps_all_crop,
+                )
 
         # Face Editor (After First)
         if (
@@ -5057,17 +5077,27 @@ class FrameWorker(threading.Thread):
                 or parameters["FaceExpressionBrowsToggle"]
                 or parameters["FaceExpressionGeneralToggle"]
                 or parameters.get("FaceExpressionModeSelection", "Advanced") == "Simple"
+                or parameters.get("FaceExpressionModeSelection", "Advanced") == "Recast"
             )
             and parameters["FaceExpressionBeforeTypeSelection"]
             == "After Second Restorer"
         ):
-            swap = self.frame_edits.apply_face_expression_restorer(
-                original_face_512,
-                swap,
-                cast(dict, parameters),
-                cast(dict, control),
-                driving_kps=kps_all_crop,
-            )
+            if parameters.get("FaceExpressionModeSelection", "Advanced") == "Recast":
+                swap = self.frame_edits.apply_perform_recast(
+                    original_face_512,
+                    swap,
+                    cast(dict, parameters),
+                    cast(dict, control),
+                    driving_kps=kps_all_crop,
+                )
+            else:
+                swap = self.frame_edits.apply_face_expression_restorer(
+                    original_face_512,
+                    swap,
+                    cast(dict, parameters),
+                    cast(dict, control),
+                    driving_kps=kps_all_crop,
+                )
 
         # Editor (After Second)
         if (
