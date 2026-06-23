@@ -12,7 +12,13 @@ MAX_DOWNLOAD_ATTEMPTS = 3  # Number of retries for a failed download.
 REQUEST_TIMEOUT = 10  # Timeout for network requests in seconds.
 
 
-def download_file(model_name: str, file_path: str, correct_hash: str, url: str) -> bool:
+def download_file(
+    model_name: str,
+    file_path: str,
+    correct_hash: str,
+    url: str,
+    skip_hash_check: bool = False,
+) -> bool:
     """
     Downloads a model file from a given URL, verifies its integrity using a hash,
     and handles retries on failure.
@@ -31,9 +37,22 @@ def download_file(model_name: str, file_path: str, correct_hash: str, url: str) 
         bool: True if the file was successfully downloaded and verified, False otherwise.
     """
 
+    # Ensure the destination directory exists. Models grouped under subfolders
+    # (e.g. ``model_assets/performrecast_onnx/``) would otherwise fail with a
+    # FileNotFoundError on a fresh/portable install where the subfolder has not
+    # been created yet (the root cause of broken portable update downloads).
+    parent_dir = os.path.dirname(file_path)
+    if parent_dir:
+        os.makedirs(parent_dir, exist_ok=True)
+
     # First, check if the file already exists and has the correct integrity.
     # This avoids re-downloading large files unnecessarily.
     if Path(file_path).is_file():
+        if skip_hash_check:
+            print(
+                f"\n[INFO] Skipping '{model_name}': file exists (hash check skipped — optimized models mode)."
+            )
+            return True
         if check_file_integrity(file_path, correct_hash):
             print(
                 f"\n[INFO] Skipping '{model_name}': file already exists and is valid."

@@ -5,6 +5,7 @@
 *.exe
 *.jpg
 *.json
+!/version.json
 *.mp4
 *.onnx
 *.profile
@@ -29,9 +30,11 @@ jobs/
 merged_embeddings*.txt
 model_assets/liveportrait_onnx/*.onnx
 model_assets/liveportrait_onnx/*.trt
-venv
-model_assets/reference_kv_data/
+venv/
+.venv/
 model_assets/canonswap/
+model_assets/reference_kv_data/
+model_assets/torch_compile_cache
 output/
 saved_parameters*.json
 source_images/
@@ -41,3 +44,4 @@ tensorrt-engines/
 test_frames*/
 test_videos*/
 presets/
+temp_files/

@@ -4,13 +4,18 @@
     <file>media/webcam.png</file>
     <file>media/video.png</file>
     <file>media/fullscreen.png</file>
+    <file>media/fullscreen_v2.png</file>
+    <file>media/theatre_hover.png</file>
+    <file>media/theatre_mode.png</file>
     <file>media/open_file.png</file>
+    <file>media/filter.png</file>
     <file>media/save_file_as.png</file>
     <file>media/save_file.png</file>
     <file>media/add_marker_hover.png</file>
     <file>media/add_marker_off.png</file>
     <file>media/audio_off.png</file>
     <file>media/audio_on.png</file>
+    <file>media/audio_toggle.png</file>
     <file>media/marker.png</file>
     <file>media/marker_save.png</file>
     <file>media/next_marker_hover.png</file>
@@ -29,6 +34,7 @@
     <file>media/remove_marker_hover.png</file>
     <file>media/remove_marker_off.png</file>
     <file>media/visomaster_small.png</file>
+    <file>media/visomaster_full.png</file>
     <file>media/save.png</file>
     <file>media/splash.png</file>
     <file>media/splash_next.png</file>

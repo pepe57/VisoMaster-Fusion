@@ -3,6 +3,7 @@ from functools import partial
 
 from PySide6 import QtWidgets, QtGui, QtCore
 from app.ui.widgets.actions import list_view_actions
+from app.ui.widgets.actions import video_control_actions
 from app.ui.widgets import ui_workers
 import app.helpers.miscellaneous as misc_helpers
 
@@ -33,6 +34,8 @@ class videoSeekSliderLineEditEventFilter(QtCore.QObject):
         if event.type() == QtCore.QEvent.KeyPress:
             # Check if the pressed key is Enter/Return
             if event.key() in (QtCore.Qt.Key_Enter, QtCore.Qt.Key_Return):
+                if video_control_actions.is_issue_scan_active(self.main_window):
+                    return True
                 new_value = line_edit.text()
                 # Reset the line edit value to the slider value if the user input an empty text
                 if new_value == "":
@@ -59,25 +62,31 @@ class VideoSeekSliderEventFilter(QtCore.QObject):
 
     def eventFilter(self, slider, event):
         if event.type() == QtCore.QEvent.Type.KeyPress:
-            if event.key() in {QtCore.Qt.Key_Left, QtCore.Qt.Key_Right}:
-                # Allow default slider movement
-                result = super().eventFilter(slider, event)
-
-                # After the slider moves, call the custom processing function
-                QtCore.QTimer.singleShot(
-                    0, self.main_window.video_processor.process_current_frame
+            if event.key() == QtCore.Qt.Key_Right:
+                # Force strictly 1 frame advance through our controlled pipeline
+                video_control_actions.advance_video_slider_by_n_frames(
+                    self.main_window, 1
                 )
+                return True  # Stop QT from applying default values
 
-                return result  # Return the result of the default handling
+            elif event.key() == QtCore.Qt.Key_Left:
+                # Force strictly 1 frame rewind through our controlled pipeline
+                video_control_actions.rewind_video_slider_by_n_frames(
+                    self.main_window, 1
+                )
+                return True  # Stop QT from applying default values
+
         elif event.type() == QtCore.QEvent.Type.Wheel:
-            # Allow default slider movement
-            result = super().eventFilter(slider, event)
+            # Intercept mousewheel to use FrameSkipStepSlider logic
+            delta = event.angleDelta().y()
+            if delta > 0:
+                # If wheel up (Advance)
+                video_control_actions.advance_video_slider_by_n_frames(self.main_window)
+            elif delta < 0:
+                # If wheel down (Rewind)
+                video_control_actions.rewind_video_slider_by_n_frames(self.main_window)
 
-            # After the slider moves, call the custom processing function
-            QtCore.QTimer.singleShot(
-                0, self.main_window.video_processor.process_current_frame
-            )
-            return result
+            return True  # Stop QT from applying default values
 
         # For other events, use the default behavior
         return super().eventFilter(slider, event)
@@ -93,10 +102,20 @@ class ListWidgetEventFilter(QtCore.QObject):
         list_widget: QtWidgets.QListWidget,
         event: QtCore.QEvent | QtGui.QDropEvent | QtGui.QMouseEvent,
     ):
-        if (
-            list_widget == self.main_window.targetVideosList
-            or list_widget == self.main_window.targetVideosList.viewport()
-        ):
+        # During application shutdown, Qt deletes the C++ widgets before the
+        # Python wrappers; events may still fire on this filter while the
+        # underlying QListWidget / its viewport have already been destroyed.
+        # Touching them then raises shiboken's "Internal C++ object … already
+        # deleted." Bail out cleanly so the atexit traceback stops appearing.
+        try:
+            target_videos_list = self.main_window.targetVideosList
+            target_videos_viewport = target_videos_list.viewport()
+            input_faces_list = self.main_window.inputFacesList
+            input_faces_viewport = input_faces_list.viewport()
+        except RuntimeError:
+            return False
+
+        if list_widget == target_videos_list or list_widget == target_videos_viewport:
             if event.type() == QtCore.QEvent.Type.MouseButtonPress:
                 if (
                     event.button() == QtCore.Qt.MouseButton.LeftButton
@@ -114,6 +133,11 @@ class ListWidgetEventFilter(QtCore.QObject):
             # Handle the drop event
             elif event.type() == QtCore.QEvent.Type.Drop:
                 if event.mimeData().hasUrls():
+                    if video_control_actions.block_if_issue_scan_active(
+                        self.main_window, "change target media"
+                    ):
+                        event.ignore()
+                        return True
                     # Extract file paths
                     file_paths = []
                     for url in event.mimeData().urls():
@@ -143,10 +167,7 @@ class ListWidgetEventFilter(QtCore.QObject):
                     event.acceptProposedAction()
                     return True
 
-        elif (
-            list_widget == self.main_window.inputFacesList
-            or list_widget == self.main_window.inputFacesList.viewport()
-        ):
+        elif list_widget == input_faces_list or list_widget == input_faces_viewport:
             if event.type() == QtCore.QEvent.Type.MouseButtonPress:
                 if (
                     event.button() == QtCore.Qt.MouseButton.LeftButton
@@ -166,6 +187,11 @@ class ListWidgetEventFilter(QtCore.QObject):
             # Handle the drop event
             elif event.type() == QtCore.QEvent.Type.Drop:
                 if event.mimeData().hasUrls():
+                    if video_control_actions.block_if_issue_scan_active(
+                        self.main_window, "load input faces"
+                    ):
+                        event.ignore()
+                        return True
                     # Extract file paths
                     file_paths = []
                     for url in event.mimeData().urls():

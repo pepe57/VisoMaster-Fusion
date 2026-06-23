@@ -4,6 +4,7 @@ import torch
 import numpy as np
 from torchvision.transforms import v2
 from skimage import transform as trans
+import kornia.geometry.transform as kgm
 
 if TYPE_CHECKING:
     from app.processors.models_processor import ModelsProcessor
@@ -14,12 +15,6 @@ class FaceRestorers:
         self.models_processor = models_processor
         self.active_model_slot1: Optional[str] = None
         self.active_model_slot2: Optional[str] = None
-        self.resize_transforms = {
-            512: v2.Resize((512, 512), antialias=True),
-            256: v2.Resize((256, 256), antialias=False),
-            1024: v2.Resize((1024, 1024), antialias=False),
-            2048: v2.Resize((2048, 2048), antialias=False),
-        }
         self._warned_models: set[str] = set()  # To track warnings
         self.model_map = {
             "GFPGAN-v1.4": "GFPGANv1.4",
@@ -81,9 +76,10 @@ class FaceRestorers:
 
         try:
             # ⚠️ This is a critical synchronization point.
-            if self.models_processor.device == "cuda":
-                torch.cuda.synchronize()
-            elif self.models_processor.device != "cpu":
+            # PRE-INFERENCE SYNC
+            if self.models_processor.device_type == "cuda":
+                torch.cuda.current_stream().synchronize()
+            elif self.models_processor.device_type != "cpu":
                 # This handles synchronization for other execution providers (e.g., DirectML)
                 # by synchronizing with a placeholder vector.
                 self.models_processor.syncvec.cpu()
@@ -109,17 +105,8 @@ class FaceRestorers:
         if not model_name_to_load:
             return swapped_face_upscaled
 
-        # The model state (active_model_slot1/2) is now managed by
-        # control_actions.handle_restorer_state_change and handle_model_selection_change.
-
-        temp = swapped_face_upscaled
-        t512 = self.resize_transforms[512]
-        t256 = self.resize_transforms[256]
-        t1024 = self.resize_transforms[1024]
-        t2048 = self.resize_transforms[2048]
-
         # If using a separate detection mode
-        if restorer_det_type == "Blend" or restorer_det_type == "Reference":
+        if restorer_det_type in ["Blend", "Reference"]:
             if restorer_det_type == "Blend":
                 # Set up Transformation
                 dst = self.models_processor.arcface_dst * 4.0
@@ -134,42 +121,68 @@ class FaceRestorers:
                     return swapped_face_upscaled
                 dst = target_kps
 
-            # Return non-enhanced face if keypoints are empty
-            if not isinstance(dst, np.ndarray) or len(dst) == 0:
-                return swapped_face_upscaled
-
-            tform = trans.SimilarityTransform()
             try:
-                tform.estimate(dst, self.models_processor.FFHQ_kps)
+                # Use from_estimate constructor instead of .estimate()
+                if hasattr(trans.SimilarityTransform, "from_estimate"):
+                    tform = trans.SimilarityTransform.from_estimate(
+                        dst, self.models_processor.FFHQ_kps
+                    )
+                else:
+                    tform = trans.SimilarityTransform()
+                    tform.estimate(dst, self.models_processor.FFHQ_kps)
             except Exception:
                 return swapped_face_upscaled
-            # Transform, scale, and normalize
-            temp = v2.functional.affine(
-                swapped_face_upscaled,
-                tform.rotation * 57.2958,
-                (tform.translation[0], tform.translation[1]),
-                tform.scale,
-                0,
-                center=(0, 0),
-            )
-            temp = v2.functional.crop(temp, 0, 0, 512, 512)
 
-        temp = torch.div(temp, 255)
+            # OPTIMIZED: Direct GPU Affine Warp with Kornia, skipping torchvision crop/affine
+            M_tensor = (
+                torch.from_numpy(tform.params[0:2])
+                .float()
+                .unsqueeze(0)
+                .to(swapped_face_upscaled.device)
+            )
+            img_b = (
+                swapped_face_upscaled.unsqueeze(0)
+                if swapped_face_upscaled.dim() == 3
+                else swapped_face_upscaled
+            )
+
+            # Kornia allocates a new tensor here, so we own this memory space.
+            temp = kgm.warp_affine(
+                img_b.float(),
+                M_tensor,
+                dsize=(512, 512),
+                mode="bilinear",
+                align_corners=True,
+            ).squeeze(0)
+            # Safe to perform math operations since 'temp' is a brand new tensor
+            temp = temp.float() / 255.0
+
+        else:
+            # If we did not warp the image, we MUST clone the original tensor
+            # before applying division. Using .div_(255.0) on the original reference corrupts
+            # memory for other threads (Race Condition).
+            temp = swapped_face_upscaled.clone().float() / 255.0
+
+        # Now safe to use inplace normalization as we definitely own the 'temp' memory footprint
         temp = v2.functional.normalize(
-            temp, (0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=False
+            temp, (0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True
         )
 
         if restorer_type == "GPEN-256":
-            temp = t256(temp)
+            temp = v2.functional.resize(temp, [256, 256], antialias=False)
 
         temp = torch.unsqueeze(temp, 0).contiguous()
 
         # Bindings
-        outpred = torch.empty(
-            (1, 3, 512, 512), dtype=torch.float32, device=self.models_processor.device
-        ).contiguous()
+        # FR-ROBUST-04: removed default 512x512 pre-allocation; each branch allocates at correct size
+        outpred = None
 
         if restorer_type == "GFPGAN-v1.4":
+            outpred = torch.empty(
+                (1, 3, 512, 512),
+                dtype=torch.float32,
+                device=self.models_processor.device,
+            ).contiguous()
             self.run_GFPGAN(temp, outpred)
 
         elif restorer_type == "GFPGAN-1024":
@@ -181,6 +194,11 @@ class FaceRestorers:
             self.run_GFPGAN1024(temp, outpred)
 
         elif restorer_type == "CodeFormer":
+            outpred = torch.empty(
+                (1, 3, 512, 512),
+                dtype=torch.float32,
+                device=self.models_processor.device,
+            ).contiguous()
             self.run_codeformer(temp, outpred, fidelity_weight)
 
         elif restorer_type == "GPEN-256":
@@ -192,10 +210,15 @@ class FaceRestorers:
             self.run_GPEN_256(temp, outpred)
 
         elif restorer_type == "GPEN-512":
+            outpred = torch.empty(
+                (1, 3, 512, 512),
+                dtype=torch.float32,
+                device=self.models_processor.device,
+            ).contiguous()
             self.run_GPEN_512(temp, outpred)
 
         elif restorer_type == "GPEN-1024":
-            temp = t1024(temp)
+            temp = v2.functional.resize(temp, [1024, 1024], antialias=False)
             outpred = torch.empty(
                 (1, 3, 1024, 1024),
                 dtype=torch.float32,
@@ -204,7 +227,7 @@ class FaceRestorers:
             self.run_GPEN_1024(temp, outpred)
 
         elif restorer_type == "GPEN-2048":
-            temp = t2048(temp)
+            temp = v2.functional.resize(temp, [2048, 2048], antialias=False)
             outpred = torch.empty(
                 (1, 3, 2048, 2048),
                 dtype=torch.float32,
@@ -213,41 +236,68 @@ class FaceRestorers:
             self.run_GPEN_2048(temp, outpred)
 
         elif restorer_type == "RestoreFormer++":
+            outpred = torch.empty(
+                (1, 3, 512, 512),
+                dtype=torch.float32,
+                device=self.models_processor.device,
+            ).contiguous()
             self.run_RestoreFormerPlusPlus(temp, outpred)
 
         elif restorer_type == "VQFR-v2":
+            outpred = torch.empty(
+                (1, 3, 512, 512),
+                dtype=torch.float32,
+                device=self.models_processor.device,
+            ).contiguous()
             self.run_VQFR_v2(temp, outpred, fidelity_weight)
 
-        # Format back to cxHxW @ 255
-        outpred = torch.squeeze(outpred)
-        outpred = torch.clamp(outpred, -1, 1)
-        outpred = torch.add(outpred, 1)
-        outpred = torch.div(outpred, 2)
-        outpred = torch.mul(outpred, 255)
+        if outpred is None:
+            return swapped_face_upscaled
 
-        if (
-            restorer_type == "GPEN-256"
-            or restorer_type == "GPEN-1024"
-            or restorer_type == "GPEN-2048"
-            or restorer_type == "GFPGAN-1024"
-        ):
-            outpred = t512(outpred)
+        # OPTIMIZED: Fused in-place math operations to save VRAM allocations.
+        # Math: ((x clamped [-1, 1]) + 1.0) * 127.5 is equivalent to /2 * 255.
+        outpred = outpred.squeeze(0).clamp_(-1.0, 1.0).add_(1.0).mul_(127.5)
+
+        if restorer_type in ["GPEN-256", "GPEN-1024", "GPEN-2048", "GFPGAN-1024"]:
+            outpred = v2.functional.resize(outpred, [512, 512], antialias=True)
 
         # Invert Transform
-        if restorer_det_type == "Blend" or restorer_det_type == "Reference":
-            outpred = v2.functional.affine(
-                outpred,
-                tform.inverse.rotation * 57.2958,
-                (tform.inverse.translation[0], tform.inverse.translation[1]),
-                tform.inverse.scale,
-                0,
-                interpolation=v2.InterpolationMode.BILINEAR,
-                center=(0, 0),
+        if restorer_det_type in ["Blend", "Reference"]:
+            # OPTIMIZED: Direct Inverse GPU Affine Warp with Kornia
+            M_inv_tensor = (
+                torch.from_numpy(tform.inverse.params[0:2])
+                .float()
+                .unsqueeze(0)
+                .to(outpred.device)
             )
+            out_b = outpred.unsqueeze(0) if outpred.dim() == 3 else outpred
+            dsize = (swapped_face_upscaled.shape[1], swapped_face_upscaled.shape[2])
 
-        # Blend
+            outpred = kgm.warp_affine(
+                out_b,
+                M_inv_tensor,
+                dsize=(dsize[0], dsize[1]),
+                mode="bilinear",
+                padding_mode="zeros",
+                align_corners=True,
+            ).squeeze(0)
+
+        # Blend (Disabled by default as in original code)
         # alpha = float(restorer_blend)/100.0
         # outpred = torch.add(torch.mul(outpred, alpha), torch.mul(swapped_face_upscaled, 1-alpha))
+
+        # --- EXPLICIT CLEANUP ---
+        # Explicitly delete local intermediate tensors to free VRAM immediately
+        # before returning the final image. This keeps the VRAM peak perfectly flat.
+        try:
+            del temp
+            if restorer_det_type in ["Blend", "Reference"]:
+                del M_tensor
+                del img_b
+                del M_inv_tensor
+                del out_b
+        except Exception:
+            pass
 
         return outpred
 
@@ -260,13 +310,16 @@ class FaceRestorers:
         output_latent_tensor: Placeholder for Batch x 8 x LatentH x LatentW, float32
         """
         model_name = "RefLDMVAEEncoder"
-        ort_session = self.models_processor.models[model_name]
-        if not ort_session:
+        # FR-BUG-04: use .get() to avoid KeyError when model is not yet loaded
+        ort_session = self.models_processor.models.get(model_name)
+        if ort_session is None:
+            # Lazy reload in case clear_gpu_memory() cleared the session after a provider switch.
+            self.models_processor.ensure_denoiser_models_loaded()
+            ort_session = self.models_processor.models.get(model_name)
+        if ort_session is None:
             error_msg = f"[ERROR] VAE Encoder model '{model_name}' not loaded when run_vae_encoder was called. This model should be loaded by ModelsProcessor.ensure_denoiser_models_loaded()."
             print(error_msg)
-            raise RuntimeError(
-                error_msg
-            )  # Or handle more gracefully depending on desired behavior
+            raise RuntimeError(error_msg)
 
         input_name = (
             ort_session.get_inputs()[0].name
@@ -282,16 +335,16 @@ class FaceRestorers:
         io_binding = ort_session.io_binding()
         io_binding.bind_input(
             name=input_name,
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=tuple(image_input_tensor.shape),
             buffer_ptr=image_input_tensor.data_ptr(),
         )
         io_binding.bind_output(
             name=output_name,
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=tuple(output_latent_tensor.shape),
             buffer_ptr=output_latent_tensor.data_ptr(),
@@ -309,8 +362,13 @@ class FaceRestorers:
         output_image_tensor: Placeholder for Batch x 3 x H x W, float32, normalized to [-1, 1]
         """
         model_name = "RefLDMVAEDecoder"
-        ort_session = self.models_processor.models[model_name]
-        if not ort_session:
+        # FR-BUG-04: use .get() to avoid KeyError when model is not yet loaded
+        ort_session = self.models_processor.models.get(model_name)
+        if ort_session is None:
+            # Lazy reload in case clear_gpu_memory() cleared the session after a provider switch.
+            self.models_processor.ensure_denoiser_models_loaded()
+            ort_session = self.models_processor.models.get(model_name)
+        if ort_session is None:
             error_msg = f"[ERROR] VAE Decoder model '{model_name}' not loaded when run_vae_decoder was called. This model should be loaded by ModelsProcessor.ensure_denoiser_models_loaded()."
             print(error_msg)
             raise RuntimeError(error_msg)
@@ -329,16 +387,16 @@ class FaceRestorers:
         io_binding = ort_session.io_binding()
         io_binding.bind_input(
             name=input_name,
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=tuple(latent_input_tensor.shape),
             buffer_ptr=latent_input_tensor.data_ptr(),
         )
         io_binding.bind_output(
             name=output_name,
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=tuple(output_image_tensor.shape),
             buffer_ptr=output_image_tensor.data_ptr(),
@@ -365,20 +423,18 @@ class FaceRestorers:
         if not ort_session:
             # Enhanced error reporting
             error_messages = [
-                f"[ERROR] UNet model '{model_name}' not loaded when run_ref_ldm_unet was called."
+                f"[ERROR] UNet model '{model_name}' not loaded when run_ref_ldm_unet was called.",
+                "  This model should be loaded by ModelsProcessor.apply_denoiser_unet or a similar setup routine.",
             ]
-            error_messages.append(
-                "  This model should be loaded by ModelsProcessor.apply_denoiser_unet or a similar setup routine."
-            )
-            # ... (error reporting details omitted for brevity) ...
             print("\n".join(error_messages))
             return
 
         onnx_output_name = "unet_output"
 
         io_binding = ort_session.io_binding()
-        bind_device_type = self.models_processor.device
-        bind_device_id = 0
+        bind_device_type = self.models_processor.device_type
+        bind_device = self.models_processor.device
+        bind_device_id = self.models_processor.binding_device_id
 
         # Bind standard inputs
         io_binding.bind_input(
@@ -439,7 +495,7 @@ class FaceRestorers:
                 ):
                     actual_kv_tensors_for_binding[k_name_onnx] = (
                         k_tensor_original.unsqueeze(0)
-                        .to(device=bind_device_type, dtype=torch.float32)
+                        .to(device=bind_device, dtype=torch.float32)
                         .contiguous()
                     )
 
@@ -449,16 +505,27 @@ class FaceRestorers:
                 ):
                     actual_kv_tensors_for_binding[v_name_onnx] = (
                         v_tensor_original.unsqueeze(0)
-                        .to(device=bind_device_type, dtype=torch.float32)
+                        .to(device=bind_device, dtype=torch.float32)
                         .contiguous()
                     )
 
+        # IMPORTANT: Keep references to temporary zero tensors to prevent GC
+        keep_alive_tensors: list = []
+        # FS-MEM-01: also keep actual KV tensors alive to prevent premature GC
+        keep_alive_tensors.extend(actual_kv_tensors_for_binding.values())
+
         for onnx_kv_name, expected_shape in onnx_kv_input_names_to_shape.items():
             tensor_to_bind = actual_kv_tensors_for_binding.get(onnx_kv_name)
+
             if tensor_to_bind is None:
+                # Create a zero tensor for missing K/V inputs (e.g., unconditional pass)
                 tensor_to_bind = torch.zeros(
-                    expected_shape, dtype=torch.float32, device=bind_device_type
+                    expected_shape, dtype=torch.float32, device=bind_device
                 ).contiguous()
+                # We MUST store this tensor in a list that persists for the function scope
+                # Otherwise, it might be garbage collected before .run() is called
+                keep_alive_tensors.append(tensor_to_bind)
+
             io_binding.bind_input(
                 name=onnx_kv_name,
                 device_type=bind_device_type,
@@ -482,6 +549,7 @@ class FaceRestorers:
 
     def run_GFPGAN(self, image, output):
         model_name = "GFPGANv1.4"
+
         ort_session = self._get_model_session(model_name)
         if not ort_session:
             return  # Silently skip if model failed to load
@@ -489,16 +557,16 @@ class FaceRestorers:
         io_binding = ort_session.io_binding()
         io_binding.bind_input(
             name="input",
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=(1, 3, 512, 512),
             buffer_ptr=image.data_ptr(),
         )
         io_binding.bind_output(
             name="output",
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=(1, 3, 512, 512),
             buffer_ptr=output.data_ptr(),
@@ -509,6 +577,7 @@ class FaceRestorers:
 
     def run_GFPGAN1024(self, image, output):
         model_name = "GFPGAN1024"
+
         ort_session = self._get_model_session(model_name)
         if not ort_session:
             return  # Silently skip
@@ -516,16 +585,16 @@ class FaceRestorers:
         io_binding = ort_session.io_binding()
         io_binding.bind_input(
             name="input",
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=(1, 3, 512, 512),
             buffer_ptr=image.data_ptr(),
         )
         io_binding.bind_output(
             name="output",
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=(1, 3, 1024, 1024),
             buffer_ptr=output.data_ptr(),
@@ -536,6 +605,7 @@ class FaceRestorers:
 
     def run_GPEN_256(self, image, output):
         model_name = "GPENBFR256"
+
         ort_session = self._get_model_session(model_name)
         if not ort_session:
             return  # Silently skip
@@ -543,16 +613,16 @@ class FaceRestorers:
         io_binding = ort_session.io_binding()
         io_binding.bind_input(
             name="input",
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=(1, 3, 256, 256),
             buffer_ptr=image.data_ptr(),
         )
         io_binding.bind_output(
             name="output",
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=(1, 3, 256, 256),
             buffer_ptr=output.data_ptr(),
@@ -563,6 +633,7 @@ class FaceRestorers:
 
     def run_GPEN_512(self, image, output):
         model_name = "GPENBFR512"
+
         ort_session = self._get_model_session(model_name)
         if not ort_session:
             return  # Silently skip
@@ -570,16 +641,16 @@ class FaceRestorers:
         io_binding = ort_session.io_binding()
         io_binding.bind_input(
             name="input",
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=(1, 3, 512, 512),
             buffer_ptr=image.data_ptr(),
         )
         io_binding.bind_output(
             name="output",
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=(1, 3, 512, 512),
             buffer_ptr=output.data_ptr(),
@@ -590,6 +661,7 @@ class FaceRestorers:
 
     def run_GPEN_1024(self, image, output):
         model_name = "GPENBFR1024"
+
         ort_session = self._get_model_session(model_name)
         if not ort_session:
             return  # Silently skip
@@ -597,16 +669,16 @@ class FaceRestorers:
         io_binding = ort_session.io_binding()
         io_binding.bind_input(
             name="input",
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=(1, 3, 1024, 1024),
             buffer_ptr=image.data_ptr(),
         )
         io_binding.bind_output(
             name="output",
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=(1, 3, 1024, 1024),
             buffer_ptr=output.data_ptr(),
@@ -617,6 +689,7 @@ class FaceRestorers:
 
     def run_GPEN_2048(self, image, output):
         model_name = "GPENBFR2048"
+
         ort_session = self._get_model_session(model_name)
         if not ort_session:
             return  # Silently skip
@@ -624,16 +697,16 @@ class FaceRestorers:
         io_binding = ort_session.io_binding()
         io_binding.bind_input(
             name="input",
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=(1, 3, 2048, 2048),
             buffer_ptr=image.data_ptr(),
         )
         io_binding.bind_output(
             name="output",
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=(1, 3, 2048, 2048),
             buffer_ptr=output.data_ptr(),
@@ -651,8 +724,8 @@ class FaceRestorers:
         io_binding = ort_session.io_binding()
         io_binding.bind_input(
             name="x",
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=(1, 3, 512, 512),
             buffer_ptr=image.data_ptr(),
@@ -661,8 +734,8 @@ class FaceRestorers:
         io_binding.bind_cpu_input("w", w)
         io_binding.bind_output(
             name="y",
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=(1, 3, 512, 512),
             buffer_ptr=output.data_ptr(),
@@ -677,37 +750,51 @@ class FaceRestorers:
         if not ort_session:
             return  # Silently skip
 
-        assert fidelity_ratio_value >= 0.0 and fidelity_ratio_value <= 1.0, (
-            "fidelity_ratio must in range[0,1]"
-        )
-        fidelity_ratio = torch.tensor(fidelity_ratio_value).to(
+        # FR-ROBUST-05: replace assert with an explicit ValueError so it is never silenced by -O flag
+        if not (0.0 <= fidelity_ratio_value <= 1.0):
+            raise ValueError(
+                f"fidelity_ratio_value must be in [0,1], got {fidelity_ratio_value}"
+            )
+        fidelity_ratio = torch.tensor(fidelity_ratio_value, dtype=torch.float32).to(
             self.models_processor.device
         )
 
         io_binding = ort_session.io_binding()
         io_binding.bind_input(
             name="x_lq",
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=image.size(),
             buffer_ptr=image.data_ptr(),
         )
         io_binding.bind_input(
             name="fidelity_ratio",
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=fidelity_ratio.size(),
             buffer_ptr=fidelity_ratio.data_ptr(),
         )
-        io_binding.bind_output("enc_feat", self.models_processor.device)
-        io_binding.bind_output("quant_logit", self.models_processor.device)
-        io_binding.bind_output("texture_dec", self.models_processor.device)
+        io_binding.bind_output(
+            "enc_feat",
+            self.models_processor.device_type,
+            self.models_processor.binding_device_id,
+        )
+        io_binding.bind_output(
+            "quant_logit",
+            self.models_processor.device_type,
+            self.models_processor.binding_device_id,
+        )
+        io_binding.bind_output(
+            "texture_dec",
+            self.models_processor.device_type,
+            self.models_processor.binding_device_id,
+        )
         io_binding.bind_output(
             name="main_dec",
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=(1, 3, 512, 512),
             buffer_ptr=output.data_ptr(),
@@ -725,34 +812,90 @@ class FaceRestorers:
         io_binding = ort_session.io_binding()
         io_binding.bind_input(
             name="input",
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=image.size(),
             buffer_ptr=image.data_ptr(),
         )
         io_binding.bind_output(
             name="2359",
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=output.size(),
             buffer_ptr=output.data_ptr(),
         )
-        io_binding.bind_output("1228", self.models_processor.device)
-        io_binding.bind_output("1238", self.models_processor.device)
-        io_binding.bind_output("onnx::MatMul_1198", self.models_processor.device)
-        io_binding.bind_output("onnx::Shape_1184", self.models_processor.device)
-        io_binding.bind_output("onnx::ArgMin_1182", self.models_processor.device)
-        io_binding.bind_output("input.1", self.models_processor.device)
-        io_binding.bind_output("x", self.models_processor.device)
-        io_binding.bind_output("x.3", self.models_processor.device)
-        io_binding.bind_output("x.7", self.models_processor.device)
-        io_binding.bind_output("x.11", self.models_processor.device)
-        io_binding.bind_output("x.15", self.models_processor.device)
-        io_binding.bind_output("input.252", self.models_processor.device)
-        io_binding.bind_output("input.280", self.models_processor.device)
-        io_binding.bind_output("input.288", self.models_processor.device)
+        io_binding.bind_output(
+            "1228",
+            self.models_processor.device_type,
+            self.models_processor.binding_device_id,
+        )
+        io_binding.bind_output(
+            "1238",
+            self.models_processor.device_type,
+            self.models_processor.binding_device_id,
+        )
+        io_binding.bind_output(
+            "onnx::MatMul_1198",
+            self.models_processor.device_type,
+            self.models_processor.binding_device_id,
+        )
+        io_binding.bind_output(
+            "onnx::Shape_1184",
+            self.models_processor.device_type,
+            self.models_processor.binding_device_id,
+        )
+        io_binding.bind_output(
+            "onnx::ArgMin_1182",
+            self.models_processor.device_type,
+            self.models_processor.binding_device_id,
+        )
+        io_binding.bind_output(
+            "input.1",
+            self.models_processor.device_type,
+            self.models_processor.binding_device_id,
+        )
+        io_binding.bind_output(
+            "x",
+            self.models_processor.device_type,
+            self.models_processor.binding_device_id,
+        )
+        io_binding.bind_output(
+            "x.3",
+            self.models_processor.device_type,
+            self.models_processor.binding_device_id,
+        )
+        io_binding.bind_output(
+            "x.7",
+            self.models_processor.device_type,
+            self.models_processor.binding_device_id,
+        )
+        io_binding.bind_output(
+            "x.11",
+            self.models_processor.device_type,
+            self.models_processor.binding_device_id,
+        )
+        io_binding.bind_output(
+            "x.15",
+            self.models_processor.device_type,
+            self.models_processor.binding_device_id,
+        )
+        io_binding.bind_output(
+            "input.252",
+            self.models_processor.device_type,
+            self.models_processor.binding_device_id,
+        )
+        io_binding.bind_output(
+            "input.280",
+            self.models_processor.device_type,
+            self.models_processor.binding_device_id,
+        )
+        io_binding.bind_output(
+            "input.288",
+            self.models_processor.device_type,
+            self.models_processor.binding_device_id,
+        )
 
         # Run the model with lazy build handling
         self._run_model_with_lazy_build_check(model_name, ort_session, io_binding)

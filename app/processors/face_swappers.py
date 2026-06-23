@@ -1,4 +1,5 @@
 import torch
+import threading
 from skimage import transform as trans
 from torchvision.transforms import v2
 from app.processors.utils import faceutil
@@ -15,6 +16,8 @@ class FaceSwappers:
         self.models_processor = models_processor
         self.current_swapper_model = None
         self.current_arcface_model = None
+        self._session_io_name_cache: dict = {}  # FS-PERF-02: cache input/output names keyed by session id
+        self._io_cache_lock = threading.Lock()
         self.resize_112 = v2.Resize(
             (112, 112), interpolation=v2.InterpolationMode.BILINEAR, antialias=False
         )
@@ -45,9 +48,14 @@ class FaceSwappers:
                 self.models_processor.unload_model(model_name)
 
     def _manage_model(self, new_model_name):
-        if self.current_swapper_model and self.current_swapper_model != new_model_name:
-            self.models_processor.unload_model(self.current_swapper_model)
-        self.current_swapper_model = new_model_name
+        # FS-RACE-01: protect read-modify-write of current_swapper_model with lock
+        with self.models_processor.model_lock:
+            if (
+                self.current_swapper_model
+                and self.current_swapper_model != new_model_name
+            ):
+                self.models_processor.unload_model(self.current_swapper_model)
+            # FS-BUG-07: current_swapper_model is committed only after load confirmation (see _load_swapper_model)
 
     def _load_swapper_model(self, model_name):
         """Handles loading and swapping of swapper models."""
@@ -55,6 +63,10 @@ class FaceSwappers:
         model = self.models_processor.models.get(model_name)
         if not model:
             model = self.models_processor.load_model(model_name)
+        # FS-BUG-07: only commit state after load is confirmed non-None
+        if model is not None:
+            with self.models_processor.model_lock:
+                self.current_swapper_model = model_name
         return model
 
     def _run_model_with_lazy_build_check(
@@ -79,9 +91,10 @@ class FaceSwappers:
 
         try:
             # ⚠️ This is a critical synchronization point.
-            if self.models_processor.device == "cuda":
-                torch.cuda.synchronize()
-            elif self.models_processor.device != "cpu":
+            # PRE-INFERENCE SYNC
+            if self.models_processor.device_type == "cuda":
+                torch.cuda.current_stream().synchronize()
+            elif self.models_processor.device_type != "cpu":
                 # This handles synchronization for other execution providers (e.g., DirectML)
                 self.models_processor.syncvec.cpu()
 
@@ -92,11 +105,16 @@ class FaceSwappers:
                 self.models_processor.hide_build_dialog.emit()
 
     def run_recognize_direct(
-        self, img, kps, similarity_type="Opal", arcface_model="Inswapper128ArcFace"
+        self, img, kps, similarity_type="Auto", arcface_model="Inswapper128ArcFace"
     ):
-        if self.current_arcface_model and self.current_arcface_model != arcface_model:
-            self.models_processor.unload_model(self.current_arcface_model)
-        self.current_arcface_model = arcface_model
+        # FS-RACE-01: protect read-modify-write of current_arcface_model with lock
+        with self.models_processor.model_lock:
+            if (
+                self.current_arcface_model
+                and self.current_arcface_model != arcface_model
+            ):
+                self.models_processor.unload_model(self.current_arcface_model)
+            self.current_arcface_model = arcface_model
 
         ort_session = self.models_processor.models.get(arcface_model)
         if not ort_session:
@@ -118,167 +136,189 @@ class FaceSwappers:
         return embedding, cropped_image
 
     def run_recognize(
-        self, img, kps, similarity_type="Opal", face_swapper_model="Inswapper128"
+        self, img, kps, similarity_type="Auto", face_swapper_model="Inswapper128"
     ):
         arcface_model = self.models_processor.get_arcface_model(face_swapper_model)
         return self.run_recognize_direct(img, kps, similarity_type, arcface_model)
 
-    def recognize(self, arcface_model, img, face_kps, similarity_type):
+    def recognize(self, arcface_model, img, face_kps, similarity_type=None):
+        """
+        Generates the face embedding using the specified ArcFace model and alignment strategy.
+        Automatically handles pose-awareness, ignoring user UI choice to prevent corrupted embeddings.
+        """
         ort_session = self.models_processor.models.get(arcface_model)
         if not ort_session:
-            # This is a safety check; run_recognize_direct should prevent this.
             return None, None
 
-        if similarity_type == "Optimal":
-            # Find transform & Transform
+        # --- FORCED DYNAMIC "AUTO" MODE (STATELESS) ---
+        # We ignore 'similarity_type' from UI to protect ArcFace from bad alignments (like Pearl).
+        yaw, pitch = faceutil.calc_face_yaw_pitch(face_kps)
+
+        if abs(yaw) > 30.0 or abs(pitch) > 30.0:
+            actual_mode = "Optimal"
+        else:
+            actual_mode = "Opal"
+
+        # --- ALIGNMENT STRATEGIES (Delegated to faceutil) ---
+        if actual_mode == "Optimal":
+            # Pose-aware 7-templates alignment (arcfacemap) for side faces
             img, _ = faceutil.warp_face_by_face_landmark_5(
                 img,
                 face_kps,
+                image_size=112,
                 mode="arcfacemap",
                 interpolation=v2.InterpolationMode.BILINEAR,
             )
-        elif similarity_type == "Pearl":
-            # Find transform
-            dst = self.models_processor.arcface_dst.copy()
-            dst[:, 0] += 8.0
-
-            tform = trans.SimilarityTransform()
-            tform.estimate(face_kps, dst)
-
-            # Transform
-            img = v2.functional.affine(
-                img,
-                tform.rotation * 57.2958,
-                (tform.translation[0], tform.translation[1]),
-                tform.scale,
-                0,
-                center=(0, 0),
-            )
-            img = v2.functional.crop(img, 0, 0, 128, 128)
-            img = v2.Resize(
-                (112, 112), interpolation=v2.InterpolationMode.BILINEAR, antialias=False
-            )(img)
         else:
-            # Find transform
-            tform = trans.SimilarityTransform()
-            tform.estimate(face_kps, self.models_processor.arcface_dst)
-
-            # Transform
-            img = v2.functional.affine(
+            # Standard frontal alignment (arcface112) for front faces
+            img, _ = faceutil.warp_face_by_face_landmark_5(
                 img,
-                tform.rotation * 57.2958,
-                (tform.translation[0], tform.translation[1]),
-                tform.scale,
-                0,
-                center=(0, 0),
+                face_kps,
+                image_size=112,
+                mode="arcface112",
+                interpolation=v2.InterpolationMode.BILINEAR,
             )
-            img = v2.functional.crop(img, 0, 0, 112, 112)
 
+        # --- NORMALIZATION & PRE-PROCESSING ---
+        cropped_image = img.permute(1, 2, 0).clone()  # Store for display/debug (H,W,3)
+
+        if img.dtype == torch.uint8:
+            img = img.float()
+
+        # CLONE: Prevent race conditions if Kornia passed a reference
+        img = img.clone()
+
+        # OPTIMIZED: In-Place math operations (.sub_ and .div_)
         if arcface_model == "Inswapper128ArcFace":
-            cropped_image = img.permute(1, 2, 0).clone()
-            if img.dtype == torch.uint8:
-                img = img.to(torch.float32)  # Convert to float32 if uint8
-            img = torch.sub(img, 127.5)
-            img = torch.div(img, 127.5)
+            if img.max() <= 1.0:
+                img = img * 255.0
+            img.sub_(127.5).div_(127.5)
+
         elif arcface_model == "SimSwapArcFace":
-            cropped_image = img.permute(1, 2, 0).clone()
-            if img.dtype == torch.uint8:
-                img = torch.div(img.to(torch.float32), 255.0)
-            img = v2.functional.normalize(
-                img, (0.485, 0.456, 0.406), (0.229, 0.224, 0.225), inplace=False
+            img.div_(255.0)
+            v2.functional.normalize(
+                img, (0.485, 0.456, 0.406), (0.229, 0.224, 0.225), inplace=True
             )
         else:
-            cropped_image = img.permute(1, 2, 0).clone()  # 112,112,3
-            if img.dtype == torch.uint8:
-                img = img.to(torch.float32)  # Convert to float32 if uint8
-            # Normalize
-            img = torch.div(img, 127.5)
-            img = torch.sub(img, 1)
+            img.div_(127.5).sub_(1.0)
 
-        # Prepare data and find model parameters
+        # --- INFERENCE ---
         img = torch.unsqueeze(img, 0).contiguous()
-        input_name = ort_session.get_inputs()[0].name
-        output_names = [o.name for o in ort_session.get_outputs()]
+
+        session_id = id(ort_session)
+        with self._io_cache_lock:
+            if session_id not in self._session_io_name_cache:
+                self._session_io_name_cache[session_id] = {
+                    "input": ort_session.get_inputs()[0].name,
+                    "outputs": [o.name for o in ort_session.get_outputs()],
+                }
+            input_name = self._session_io_name_cache[session_id]["input"]
+            output_names = self._session_io_name_cache[session_id]["outputs"]
 
         io_binding = ort_session.io_binding()
         io_binding.bind_input(
             name=input_name,
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=img.size(),
             buffer_ptr=img.data_ptr(),
         )
 
         for name in output_names:
-            io_binding.bind_output(name, self.models_processor.device)
+            io_binding.bind_output(
+                name,
+                self.models_processor.device_type,
+                self.models_processor.binding_device_id,
+            )
 
-        # Run the model with lazy build handling
         self._run_model_with_lazy_build_check(arcface_model, ort_session, io_binding)
 
-        # Return embedding
         return np.array(io_binding.copy_outputs_to_cpu()).flatten(), cropped_image
 
     def preprocess_image_cscs(self, img, face_kps):
-        tform = trans.SimilarityTransform()
-        tform.estimate(face_kps, self.models_processor.FFHQ_kps)
+        """
+        Preprocesses the image for the CSCS ArcFace models.
+        OPTIMIZED: Uses torchvision v2 for fast GPU affine transformations.
+        BUGFIX: Resolves skimage deprecation warning while keeping exact
+        mathematical alignment required by CSCS.
+        """
+        # OPTIMIZED: Fix deprecation warning using from_estimate
+        tform = trans.SimilarityTransform.from_estimate(
+            face_kps, self.models_processor.FFHQ_kps
+        )
 
+        # GPU Accelerated Affine Transformation (img is already a GPU Tensor here)
+        # We preserve the exact center=(0,0) geometry required by CSCS models.
         temp = v2.functional.affine(
             img,
-            tform.rotation * 57.2958,
-            (tform.translation[0], tform.translation[1]),
-            tform.scale,
-            0,
+            angle=tform.rotation * 57.2958,  # Rad to Deg
+            translate=(tform.translation[0], tform.translation[1]),
+            scale=tform.scale,
+            shear=0.0,
             center=(0, 0),
         )
-        temp = v2.functional.crop(temp, 0, 0, 512, 512)
 
+        # Fast GPU Crop and Resize
+        temp = v2.functional.crop(temp, top=0, left=0, height=512, width=512)
         image = self.resize_112(temp)
 
         cropped_image = image.permute(1, 2, 0).clone()
+
         if image.dtype == torch.uint8:
-            image = torch.div(image.to(torch.float32), 255.0)
+            image = image.float()
 
-        image = v2.functional.normalize(
-            image, (0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=False
-        )
+        # CLONE: Prevent cross-thread race conditions before in-place math
+        image = image.clone()
 
-        # Ritorna l'immagine e l'immagine ritagliata
-        return torch.unsqueeze(
-            image, 0
-        ).contiguous(), cropped_image  # (C, H, W) e (H, W, C)
+        # OPTIMIZED: In-place division and normalization for CSCS [-1.0, 1.0] standard
+        image.div_(255.0)
+        v2.functional.normalize(image, (0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True)
+
+        return torch.unsqueeze(image, 0).contiguous(), cropped_image
 
     def recognize_cscs(self, img, face_kps):
-        # Usa la funzione di preprocessamento
         img, cropped_image = self.preprocess_image_cscs(img, face_kps)
 
-        model_name = "CSCSArcFace"  # Define model_name
+        model_name = "CSCSArcFace"
         model = self.models_processor.models.get(model_name)
         if not model:
             print("[ERROR] CSCSArcFace model not loaded in recognize_cscs.")
             return None, None
 
         io_binding = model.io_binding()
+
+        # SAFETY: Clear bindings to prevent thread caching errors
+        io_binding.clear_binding_inputs()
+        io_binding.clear_binding_outputs()
+
         io_binding.bind_input(
             name="input",
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=img.size(),
             buffer_ptr=img.data_ptr(),
         )
-        io_binding.bind_output(name="output", device_type=self.models_processor.device)
+        io_binding.bind_output(
+            name="output",
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
+        )
 
-        # Run the model with lazy build handling
         self._run_model_with_lazy_build_check(model_name, model, io_binding)
 
         output = io_binding.copy_outputs_to_cpu()[0]
+
+        # Exact p=2 normalization math required by CSCS
         embedding = torch.from_numpy(output).to("cpu")
         embedding = torch.nn.functional.normalize(embedding, dim=-1, p=2)
         embedding = embedding.numpy().flatten()
 
         embedding_id = self.recognize_cscs_id_adapter(img, None)
-        embedding = embedding + embedding_id
+
+        if embedding_id.size == embedding.size:
+            embedding = embedding + embedding_id
 
         return embedding, cropped_image
 
@@ -290,27 +330,36 @@ class FaceSwappers:
 
         if not model:
             print(f"[WARN] {model_name} model not loaded.")
-            return np.array([])  # Return empty array on failure
+            return np.array([])
 
-        # Use preprocess_image_cscs when face_kps is not None. When it is None img is already preprocessed.
         if face_kps is not None:
             img, _ = self.preprocess_image_cscs(img, face_kps)
 
         io_binding = model.io_binding()
+
+        # SAFETY: Clear bindings
+        io_binding.clear_binding_inputs()
+        io_binding.clear_binding_outputs()
+
         io_binding.bind_input(
             name="input",
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=img.size(),
             buffer_ptr=img.data_ptr(),
         )
-        io_binding.bind_output(name="output", device_type=self.models_processor.device)
+        io_binding.bind_output(
+            name="output",
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
+        )
 
-        # Run the model with lazy build handling
         self._run_model_with_lazy_build_check(model_name, model, io_binding)
 
         output = io_binding.copy_outputs_to_cpu()[0]
+
+        # Exact p=2 normalization math required by CSCS
         embedding_id = torch.from_numpy(output).to("cpu")
         embedding_id = torch.nn.functional.normalize(embedding_id, dim=-1, p=2)
 
@@ -321,42 +370,65 @@ class FaceSwappers:
         return latent
 
     def run_swapper_cscs(self, image, embedding, output):
-        model_name = "CSCS"  # Use the name from the models_list
+        model_name = "CSCS"
         model = self._load_swapper_model(model_name)
         if not model:
             print("[ERROR] CSCS model not loaded.")
             return
 
+        # SAFETY: Contiguous memory blocks required by TensorRT
+        if not image.is_contiguous():
+            image = image.contiguous()
+        if not embedding.is_contiguous():
+            embedding = embedding.contiguous()
+        if not output.is_contiguous():
+            output = output.contiguous()
+
         io_binding = model.io_binding()
+
+        # SAFETY: Clear bindings
+        io_binding.clear_binding_inputs()
+        io_binding.clear_binding_outputs()
+
+        # Hardcoded IO names validated by standard CSCS export
         io_binding.bind_input(
             name="input_1",
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=(1, 3, 256, 256),
             buffer_ptr=image.data_ptr(),
         )
         io_binding.bind_input(
             name="input_2",
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=(1, 512),
             buffer_ptr=embedding.data_ptr(),
         )
         io_binding.bind_output(
             name="output",
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=(1, 3, 256, 256),
             buffer_ptr=output.data_ptr(),
         )
 
-        # Run the model with lazy build handling
         self._run_model_with_lazy_build_check(model_name, model, io_binding)
 
-    def calc_inswapper_latent(self, source_embedding):
+    def _calc_emap_latent(self, source_embedding):
+        """FS-PERF-05: shared emap-based latent computation extracted from
+        calc_inswapper_latent and calc_swapper_latent_iss."""
+        n_e = source_embedding / l2norm(source_embedding)
+        latent = n_e.reshape((1, -1))
+        latent = np.dot(latent, self.models_processor.emap)
+        latent /= np.linalg.norm(latent)
+        return latent
+
+    def _ensure_emap(self):
+        """Ensures emap is loaded; returns True if available, False otherwise."""
         if (
             not hasattr(self.models_processor, "emap")
             or not isinstance(self.models_processor.emap, np.ndarray)
@@ -364,49 +436,64 @@ class FaceSwappers:
         ):
             self.models_processor.load_model("Inswapper128")
 
-        if (
-            not hasattr(self.models_processor, "emap")
-            or not isinstance(self.models_processor.emap, np.ndarray)
-            or self.models_processor.emap.size == 0
-        ):
-            print("[ERROR] Emap could not be loaded for latent calculation.")
-            n_e = source_embedding / l2norm(source_embedding)
-            return n_e.reshape((1, -1))
+        return (
+            hasattr(self.models_processor, "emap")
+            and isinstance(self.models_processor.emap, np.ndarray)
+            and self.models_processor.emap.size > 0
+        )
 
-        n_e = source_embedding / l2norm(source_embedding)
-        latent = n_e.reshape((1, -1))
-        latent = np.dot(latent, self.models_processor.emap)
-        latent /= np.linalg.norm(latent)
-        return latent
+    def calc_inswapper_latent(self, source_embedding):
+        if not self._ensure_emap():
+            print("[ERROR] Emap could not be loaded for latent calculation.")
+            # FS-ROBUST-01: return None so callers can detect and handle the failure
+            return None
+
+        return self._calc_emap_latent(source_embedding)
 
     def run_inswapper(self, image, embedding, output):
         model_name = "Inswapper128"
+
+        # ORT-based inference
         model = self._load_swapper_model(model_name)
         if not model:
             print("[ERROR] Inswapper128 model not loaded.")
             return
 
+        # FORCE CONTIGUOUS: Essential safety check.
+        # Ensures that the memory pointer passed to TensorRT is valid and linear.
+        if not image.is_contiguous():
+            image = image.contiguous()
+        if not embedding.is_contiguous():
+            embedding = embedding.contiguous()
+        if not output.is_contiguous():
+            output = output.contiguous()
+
         io_binding = model.io_binding()
+
+        # Clear previous bindings to avoid pointer caching issues
+        io_binding.clear_binding_inputs()
+        io_binding.clear_binding_outputs()
+
         io_binding.bind_input(
             name="target",
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=(1, 3, 128, 128),
             buffer_ptr=image.data_ptr(),
         )
         io_binding.bind_input(
             name="source",
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=(1, 512),
             buffer_ptr=embedding.data_ptr(),
         )
         io_binding.bind_output(
             name="output",
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=(1, 3, 128, 128),
             buffer_ptr=output.data_ptr(),
@@ -414,6 +501,56 @@ class FaceSwappers:
 
         # Run the model with lazy build handling
         self._run_model_with_lazy_build_check(model_name, model, io_binding)
+
+    def run_inswapper_batched(
+        self, images: torch.Tensor, embedding: torch.Tensor, output: torch.Tensor
+    ) -> None:
+        """Batched InSwapper inference for pixel-shift resolution mode.
+
+        Processes each tile sequentially through the ORT session since the ONNX
+        model expects a batch size of 1.
+        """
+        model_name = "Inswapper128"
+        model = self._load_swapper_model(model_name)
+        if not model:
+            print("[ERROR] Inswapper128 model not loaded.")
+            return
+
+        batch_size = images.shape[0]
+        for idx in range(batch_size):
+            img = images[idx : idx + 1].contiguous()
+            out = output[idx : idx + 1].contiguous()
+            emb = embedding.contiguous()
+
+            io_binding = model.io_binding()
+            io_binding.clear_binding_inputs()
+            io_binding.clear_binding_outputs()
+            io_binding.bind_input(
+                name="target",
+                device_type=self.models_processor.device_type,
+                device_id=self.models_processor.binding_device_id,
+                element_type=np.float32,
+                shape=(1, 3, 128, 128),
+                buffer_ptr=img.data_ptr(),
+            )
+            io_binding.bind_input(
+                name="source",
+                device_type=self.models_processor.device_type,
+                device_id=self.models_processor.binding_device_id,
+                element_type=np.float32,
+                shape=(1, 512),
+                buffer_ptr=emb.data_ptr(),
+            )
+            io_binding.bind_output(
+                name="output",
+                device_type=self.models_processor.device_type,
+                device_id=self.models_processor.binding_device_id,
+                element_type=np.float32,
+                shape=(1, 3, 128, 128),
+                buffer_ptr=out.data_ptr(),
+            )
+            self._run_model_with_lazy_build_check(model_name, model, io_binding)
+            output[idx].copy_(out[0])
 
     def calc_swapper_latent_ghost(self, source_embedding):
         latent = source_embedding.reshape((1, -1))
@@ -421,28 +558,13 @@ class FaceSwappers:
         return latent
 
     def calc_swapper_latent_iss(self, source_embedding, version="A"):
-        if (
-            not hasattr(self.models_processor, "emap")
-            or not isinstance(self.models_processor.emap, np.ndarray)
-            or self.models_processor.emap.size == 0
-        ):
-            print("[WARN] Emap not found, loading Inswapper128 to get it.")
-            self.models_processor.load_model("Inswapper128")
-
-        if (
-            not hasattr(self.models_processor, "emap")
-            or not isinstance(self.models_processor.emap, np.ndarray)
-            or self.models_processor.emap.size == 0
-        ):
+        # FS-PERF-05: reuse shared _ensure_emap / _calc_emap_latent helpers
+        if not self._ensure_emap():
             print("[ERROR] Emap could not be loaded for latent calculation.")
             n_e = source_embedding / l2norm(source_embedding)
             return n_e.reshape((1, -1))
 
-        n_e = source_embedding / l2norm(source_embedding)
-        latent = n_e.reshape((1, -1))
-        latent = np.dot(latent, self.models_processor.emap)
-        latent /= np.linalg.norm(latent)
-        return latent
+        return self._calc_emap_latent(source_embedding)
 
     def run_iss_swapper(self, image, embedding, output, version="A"):
         model_name = f"InStyleSwapper256 Version {version}"
@@ -454,24 +576,24 @@ class FaceSwappers:
         io_binding = model.io_binding()
         io_binding.bind_input(
             name="target",
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=(1, 3, 256, 256),
             buffer_ptr=image.data_ptr(),
         )
         io_binding.bind_input(
             name="source",
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=(1, 512),
             buffer_ptr=embedding.data_ptr(),
         )
         io_binding.bind_output(
             name="output",
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=(1, 3, 256, 256),
             buffer_ptr=output.data_ptr(),
@@ -496,24 +618,24 @@ class FaceSwappers:
         io_binding = model.io_binding()
         io_binding.bind_input(
             name="input",
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=(1, 3, 512, 512),
             buffer_ptr=image.data_ptr(),
         )
         io_binding.bind_input(
             name="onnx::Gemm_1",
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=(1, 512),
             buffer_ptr=embedding.data_ptr(),
         )
         io_binding.bind_output(
             name="output",
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=(1, 3, 512, 512),
             buffer_ptr=output.data_ptr(),
@@ -525,13 +647,13 @@ class FaceSwappers:
     def run_swapper_ghostface(
         self, image, embedding, output, swapper_model="GhostFace-v2"
     ):
-        model_name, output_name = None, None
+        model_name = None
         if swapper_model == "GhostFace-v1":
-            model_name, output_name = "GhostFacev1", "781"
+            model_name = "GhostFacev1"
         elif swapper_model == "GhostFace-v2":
-            model_name, output_name = "GhostFacev2", "1165"
+            model_name = "GhostFacev2"
         elif swapper_model == "GhostFace-v3":
-            model_name, output_name = "GhostFacev3", "1549"
+            model_name = "GhostFacev3"
 
         if not model_name:
             print(f"[ERROR] Unknown GhostFace model version: {swapper_model}")
@@ -542,27 +664,37 @@ class FaceSwappers:
             print(f"[ERROR] {model_name} model not loaded.")
             return
 
+        # FS-ROBUST-02: introspect output name dynamically instead of hardcoding node IDs
+        session_id = id(ghostfaceswap_model)
+        with self._io_cache_lock:
+            if session_id not in self._session_io_name_cache:
+                self._session_io_name_cache[session_id] = {
+                    "input": ghostfaceswap_model.get_inputs()[0].name,
+                    "outputs": [o.name for o in ghostfaceswap_model.get_outputs()],
+                }
+            output_name = self._session_io_name_cache[session_id]["outputs"][0]
+
         io_binding = ghostfaceswap_model.io_binding()
         io_binding.bind_input(
             name="target",
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=(1, 3, 256, 256),
             buffer_ptr=image.data_ptr(),
         )
         io_binding.bind_input(
             name="source",
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=(1, 512),
             buffer_ptr=embedding.data_ptr(),
         )
         io_binding.bind_output(
             name=output_name,
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=(1, 3, 256, 256),
             buffer_ptr=output.data_ptr(),

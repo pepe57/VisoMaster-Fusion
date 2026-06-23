@@ -6,57 +6,17 @@ models_dir = Path(__file__).resolve().parent.parent.parent / "model_assets"
 refldm_ckpts_path = models_dir / "ref-ldm_embedding/ckpts"
 os.makedirs(refldm_ckpts_path, exist_ok=True)
 
+# Ensure the grouped ONNX model subfolders exist up front. On a fresh/portable
+# install (and during portable app updates) these subfolders are otherwise only
+# created on first download — but the PerformRecast models were missing the
+# folder, so the portable updater had nowhere to place the freshly downloaded
+# ONNX files. Creating them here makes the destinations exist regardless of how
+# the models arrive (download vs. copy-in). The downloader also makes parent
+# dirs on demand, so this is belt-and-suspenders.
+for _subfolder in ("liveportrait_onnx", "performrecast_onnx"):
+    os.makedirs(models_dir / _subfolder, exist_ok=True)
+
 assets_repo = "https://github.com/visomaster/visomaster-assets/releases/download"
-
-try:
-    import tensorrt as trt
-
-    models_trt_list = [
-        {
-            "model_name": "LivePortraitMotionExtractor",
-            "local_path": f"{models_dir}/liveportrait_onnx/motion_extractor."
-            + trt.__version__
-            + ".trt",
-            "hash": "8cab6d8fe093a07ee59e14bf83b9fbc90732ce7a6c1732b88b59f4457bea6204",
-        },
-        {
-            "model_name": "LivePortraitAppearanceFeatureExtractor",
-            "local_path": f"{models_dir}/liveportrait_onnx/appearance_feature_extractor."
-            + trt.__version__
-            + ".trt",
-            "hash": "7fea0c28948a5f0d21ae0712301084a0b4a0b1fdef48983840d58d8711da90af",
-        },
-        {
-            "model_name": "LivePortraitStitchingEye",
-            "local_path": f"{models_dir}/liveportrait_onnx/stitching_eye."
-            + trt.__version__
-            + ".trt",
-            "hash": "266afbccd79f2f5ae277242b19dd9299815b24dc453b22f6fd79fbf8f3a1e593",
-        },
-        {
-            "model_name": "LivePortraitStitchingLip",
-            "local_path": f"{models_dir}/liveportrait_onnx/stitching_lip."
-            + trt.__version__
-            + ".trt",
-            "hash": "2ac2e57eb2edd5aec70dc45023113e2ccc0495a16579c6c5d56fa30b74edc4f5",
-        },
-        {
-            "model_name": "LivePortraitStitching",
-            "local_path": f"{models_dir}/liveportrait_onnx/stitching."
-            + trt.__version__
-            + ".trt",
-            "hash": "8448de922a824b7b11eb7f470805ec22cf4ee541f7d66afeb2965094f96fd3ab",
-        },
-        {
-            "model_name": "LivePortraitWarpingSpadeFix",
-            "local_path": f"{models_dir}/liveportrait_onnx/warping_spade-fix."
-            + trt.__version__
-            + ".trt",
-            "hash": "24acdb6379b28fbefefb6339b3605693e00f1703c21ea5b8fec0215e521f6912",
-        },
-    ]
-except ModuleNotFoundError:
-    models_trt_list = []
 
 arcface_mapping_model_dict = {
     "Inswapper128": "Inswapper128ArcFace",
@@ -88,6 +48,89 @@ landmark_model_mapping = {
     "478": "FaceLandmark478",
 }
 
+fp16_safe_models_list = [
+    # --- LivePortrait ---
+    "LivePortraitAppearanceFeatureExtractor",
+    "LivePortraitStitchingEye",
+    "LivePortraitStitchingLip",
+    "LivePortraitStitching",
+    "LivePortraitWarpingSpade",
+    # --- PerformRecast ---
+    # Only F/M are fp16-safe. We tried building W (warping_module) and G
+    # (spade_generator) as mixed-precision fp16 TensorRT engines from the fp32
+    # ONNX, but in practice fp16 makes the generator emit degenerate / black
+    # faces on many ordinary frames (the 5-D grid_sample / SPADE paths overflow
+    # in fp16) — so at the natural ~2.3 crop scale far too many frames had to be
+    # skipped. This is exactly the caveat documented upstream, so W/G are kept
+    # fp32 (intentionally absent from this list). Do NOT add them back.
+    "PerformRecastAppearanceFeatureExtractor",
+    "PerformRecastMotionExtractor",
+    # --- Detectors ---
+    "RetinaFace",
+    "SCRFD2.5g",
+    "YoloFace8n",
+    "YunetN",
+    # --- Masking ---
+    "FaceParser",
+    "Occluder",
+    # --- Upscaling ---
+    "RealEsrganx2Plus",
+    "RealEsrganx4Plus",
+    "RealEsrx4v3",
+    "BSRGANx2",
+    "BSRGANx4",
+    "UltraSharpx4",
+    "UltraMixx4",
+    # --- Colors ---
+    "DeoldifyArt",
+    "DeoldifyStable",
+    "DeoldifyVideo",
+    "DDColorArt",
+    "DDcolor",
+    # --- Landmarks ---
+    "FaceLandmark5",
+    "FaceLandmark68",
+    "FaceLandmark98",
+    "FaceLandmark106",
+    "FaceLandmark203",
+    "FaceLandmark478",
+    "FaceBlendShapes",
+    # --- Restorers ---
+    "GPENBFR256",
+    "GPENBFR512",
+    "CodeFormer",
+    "VQFRv2",
+    "RestoreFormerPlusPlus",
+    # --- Recognition ---
+    "Inswapper128ArcFace",
+    "SimSwapArcFace",
+    "GhostArcFace",
+    "CSCSArcFace",
+    "CSCSIDArcFace",
+    # --- Denoiser ---
+    "RefLDMVAEEncoder",
+    "RefLDMVAEDecoder",
+    "RefLDM_UNET_EXTERNAL_KV",
+    # --- Texture ---
+    "combo_relu3_3_relu3_1",
+    # --- Swappers ---
+    "InStyleSwapper256 Version A",
+    "InStyleSwapper256 Version B",
+    "InStyleSwapper256 Version C",
+    "GhostFacev1",
+    "GhostFacev2",
+    "GhostFacev3",
+]
+
+# Models whose ONNX graph must be shape-inferred (with a static batch=1) before
+# the TensorRT EP can build an engine. The PerformRecast warping module contains
+# 5-D GridSample nodes whose outputs have no static shape, which makes the TRT EP
+# abort with "has no shape specified. Please run shape inference on the onnx
+# model first." The loader transparently builds a cached, shape-inferred sidecar
+# (``*.trtshape.onnx``) for these models. See ModelsProcessor._ensure_trt_ready_onnx.
+tensorrt_shape_infer_models = [
+    "PerformRecastWarpingModule",
+]
 
 models_list = [
     {
@@ -438,6 +481,31 @@ models_list = [
         "hash": "d6ee9af4352b47e88e0521eba6b774c48204afddc8d91c671a5f7b8a0dfb4971",
         "url": f"{assets_repo}/v0.1.0_lp/warping_spade.onnx",
     },
+    # --- PerformRecast (expression-only "Recast" mode of the Face Expression Restorer) ---
+    {
+        "model_name": "PerformRecastAppearanceFeatureExtractor",
+        "local_path": f"{models_dir}/performrecast_onnx/appearance_feature_extractor.onnx",
+        "hash": "208e4f848b430cbfa71a36dab7ec25a5b345882f846dbb27288abcfb2ae89a96",
+        "url": "https://github.com/Glat0s/PerformRecast-onnx/releases/download/onnx-v1/appearance_feature_extractor.onnx",
+    },
+    {
+        "model_name": "PerformRecastMotionExtractor",
+        "local_path": f"{models_dir}/performrecast_onnx/motion_extractor.onnx",
+        "hash": "b1b26c1b6d7520eb8020175050f0381c4f402ccaa6afbaebee259da4ff9dcb6c",
+        "url": "https://github.com/Glat0s/PerformRecast-onnx/releases/download/onnx-v1/motion_extractor.onnx",
+    },
+    {
+        "model_name": "PerformRecastWarpingModule",
+        "local_path": f"{models_dir}/performrecast_onnx/warping_module.onnx",
+        "hash": "92d8a1414a31a4117237bbfb667be02e71831a085af6697c9c3465200228a0ce",
+        "url": "https://github.com/Glat0s/PerformRecast-onnx/releases/download/onnx-v1/warping_module.onnx",
+    },
+    {
+        "model_name": "PerformRecastSpadeGenerator",
+        "local_path": f"{models_dir}/performrecast_onnx/spade_generator.onnx",
+        "hash": "4d8127313b1c2f6b53320b65208dafc22db260550f690cfa114dec646c7a8f5f",
+        "url": "https://github.com/Glat0s/PerformRecast-onnx/releases/download/onnx-v1/spade_generator.onnx",
+    },
     {
         "model_name": "RefLDMVAEEncoder",
         "local_path": f"{models_dir}/ref_ldm_vae_encoder.onnx",
@@ -473,5 +541,11 @@ models_list = [
         "local_path": f"{models_dir}/ref-ldm_embedding/ckpts/vqgan.ckpt",
         "hash": "7b08407b454f5328aaaf1eda35418a5a53dcc68caaf3bcf12ab88b8f21ec1a5d",
         "url": "https://github.com/ChiWeiHsiao/ref-ldm/releases/download/1.0.0/vqgan.ckpt",
+    },
+    {
+        "model_name": "FaceReaging",
+        "local_path": f"{models_dir}/face_reaging.onnx",
+        "hash": "62c62598a71067cf12680c8421230556d08069d172f1dc645be2a5ebe815fb1f",
+        "url": "https://github.com/VisoMasterFusion/VisoMaster-Fusion/releases/download/v1.0.0/face_reaging.onnx",
     },
 ]

@@ -13,6 +13,7 @@ from PySide6.QtWidgets import QPushButton
 import cv2
 import numpy as np
 import torch
+import gc
 
 import app.ui.widgets.actions.common_actions as common_widget_actions
 from app.ui.widgets.actions import video_control_actions
@@ -26,14 +27,112 @@ if TYPE_CHECKING:
     from app.ui.main_ui import MainWindow
 
 
+class TwoLineElidedLabel(QtWidgets.QLabel):
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(parent)
+        self._full_text = ""
+        self.setAlignment(
+            QtCore.Qt.AlignmentFlag.AlignHCenter | QtCore.Qt.AlignmentFlag.AlignTop
+        )
+        self.setWordWrap(False)
+        self.setText(text)
+
+    def setText(self, text: str) -> None:
+        self._full_text = text
+        self._update_display_text()
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self._update_display_text()
+
+    def _fit_text_prefix(self, text: str, max_width: int) -> str:
+        if not text or max_width <= 0:
+            return ""
+
+        font_metrics = self.fontMetrics()
+        if font_metrics.horizontalAdvance(text) <= max_width:
+            return text
+
+        fitted_text = ""
+        last_space_index = -1
+        for index, char in enumerate(text):
+            candidate = fitted_text + char
+            if font_metrics.horizontalAdvance(candidate) > max_width:
+                break
+            fitted_text = candidate
+            if char.isspace():
+                last_space_index = index
+
+        if last_space_index > 0:
+            return text[:last_space_index].rstrip()
+        return fitted_text.rstrip()
+
+    def _update_display_text(self) -> None:
+        if not self._full_text:
+            super().setText("")
+            return
+
+        max_width = self.contentsRect().width()
+        if max_width <= 0:
+            super().setText(self._full_text)
+            return
+
+        font_metrics = self.fontMetrics()
+        first_line = self._fit_text_prefix(self._full_text, max_width)
+
+        if not first_line or first_line == self._full_text:
+            display_text = font_metrics.elidedText(
+                self._full_text, QtCore.Qt.TextElideMode.ElideRight, max_width * 2
+            )
+            super().setText(display_text)
+            return
+
+        remaining_text = self._full_text[len(first_line) :].lstrip()
+        second_line = font_metrics.elidedText(
+            remaining_text, QtCore.Qt.TextElideMode.ElideRight, max_width
+        )
+        super().setText(f"{first_line}\n{second_line}")
+
+
 class CardButton(QPushButton):
     def __init__(self, *args, **kwargs):
-        super().__init__(*args)
-        self.main_window: "MainWindow" = kwargs.get("main_window", False)
+        self.main_window = kwargs.pop("main_window", None)
+        super().__init__(*args, **kwargs)
+        self.setFocusPolicy(QtCore.Qt.NoFocus)
+        self.setAutoDefault(False)
+        self.setDefault(False)
         self.list_item = None
-        self.list_widget: QtWidgets.QListWidget = None
+        self.list_widget = None
+        self.popMenu = None
+
+    def _release_context_menu(self, *action_attrs: str) -> None:
+        for attr in action_attrs:
+            action = getattr(self, attr, None)
+            if action is not None:
+                try:
+                    action.deleteLater()
+                except RuntimeError:
+                    pass
+                setattr(self, attr, None)
+        if self.popMenu is not None:
+            try:
+                self.popMenu.deleteLater()
+            except RuntimeError:
+                pass
+            self.popMenu = None
+
+    def _exec_context_menu(self, point) -> None:
+        if self.popMenu is not None:
+            self.popMenu.exec_(self.mapToGlobal(point))
+
+    def _restore_pre_click_checked_state(self):
+        self.blockSignals(True)
+        self.setChecked(not self.isChecked())
+        self.blockSignals(False)
 
     def get_item_position(self):
+        if self.list_widget is None:
+            return None
         for i in range(self.list_widget.count() - 1, -1, -1):
             list_item = self.list_widget.item(i)
             if list_item.listWidget().itemWidget(list_item) == self:
@@ -114,32 +213,66 @@ class TargetMediaCardButton(CardButton):
         self.webcam_index = webcam_index
         self.webcam_backend = webcam_backend
         self.media_capture: cv2.VideoCapture | bool = False
+        self._thumbnail_pixmap = QtGui.QPixmap()
         self.setCheckable(True)
+        self.setText("")
         self.setToolTip(media_path)
+
         layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(2)  # Space between icon and label
+        layout.setContentsMargins(3, 3, 3, 2)
+        layout.setSpacing(0)
+
+        self.thumbnail_label = QtWidgets.QLabel(self)
+        self.thumbnail_label.setAlignment(
+            QtCore.Qt.AlignmentFlag.AlignHCenter | QtCore.Qt.AlignmentFlag.AlignBottom
+        )
+        self.thumbnail_label.setAttribute(
+            QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
+        )
+        layout.addWidget(self.thumbnail_label, 1)
+
         filename = os.path.basename(media_path)
-        text_label = QtWidgets.QLabel(filename, self)
-        text_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignBottom)
-        text_label.setStyleSheet(
-            "font-size: 8px; font-weight:bold;"
-        )  # Style for the label
-        layout.addWidget(text_label)
+        self.text_label = TwoLineElidedLabel(filename, self)
+        title_font = self.text_label.font()
+        title_font.setPointSize(9)
+        self.text_label.setFont(title_font)
+        line_spacing = QtGui.QFontMetrics(title_font).lineSpacing()
+        self.text_label.setFixedHeight((line_spacing * 2) + 4)
+        self.text_label.setAttribute(
+            QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
+        )
+        layout.addWidget(self.text_label, 0)
+
         self.clicked.connect(self.load_media)
-        # Imposta lo stylesheet solo per questo pulsante
-        self.setStyleSheet("""
-        CardButton:checked {
-            background-color: #555555;
-            border: 2px solid #1abc9c;
-        }
-        """)
 
         # Set the context menu policy to trigger the custom context menu on right-click
         self.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         # Connect the custom context menu request signal to the custom slot
         self.customContextMenuRequested.connect(self.on_context_menu)
-        self.create_context_menu()
+
+    def set_thumbnail_pixmap(self, pixmap: QtGui.QPixmap) -> None:
+        self._thumbnail_pixmap = pixmap
+        self._update_thumbnail_pixmap()
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self._update_thumbnail_pixmap()
+
+    def _update_thumbnail_pixmap(self) -> None:
+        if self._thumbnail_pixmap.isNull():
+            self.thumbnail_label.clear()
+            return
+
+        target_size = self.thumbnail_label.contentsRect().size()
+        if not target_size.isValid():
+            return
+
+        scaled_pixmap = self._thumbnail_pixmap.scaled(
+            target_size,
+            QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+            QtCore.Qt.TransformationMode.SmoothTransformation,
+        )
+        self.thumbnail_label.setPixmap(scaled_pixmap)
 
     def reset_media_state(self):
         main_window = self.main_window
@@ -179,6 +312,12 @@ class TargetMediaCardButton(CardButton):
 
     def load_media(self):
         main_window = self.main_window
+        if video_control_actions.block_if_issue_scan_active(
+            main_window, "change target media"
+        ):
+            self._restore_pre_click_checked_state()
+            return
+
         # Deselect the currently selected video
         if main_window.selected_video_button:
             main_window.selected_video_button.toggle()  # Deselect the previous video
@@ -186,6 +325,7 @@ class TargetMediaCardButton(CardButton):
 
         # Stop the current video processing
         main_window.video_processor.stop_processing()
+        main_window.video_processor._clear_single_frame_preview_caches()
 
         if main_window.selected_target_face_id:
             main_window.current_widget_parameters = main_window.parameters[
@@ -196,7 +336,7 @@ class TargetMediaCardButton(CardButton):
         main_window.video_processor.current_frame_number = 0
         main_window.video_processor.media_path = self.media_path
         main_window.parameters = {}
-        main_window.selected_target_face_id = False
+        main_window.selected_target_face_id = None
         main_window.video_processor.current_frame = []
 
         # Release the previous media_capture if it exists
@@ -208,10 +348,15 @@ class TargetMediaCardButton(CardButton):
         rotation_angle = 0  # MODIFICATION: Added rotation variable
 
         if self.file_type == "video":
-            # MODIFICATION: Get video rotation metadata before loading
+            # Get video rotation metadata before loading
             rotation_angle = get_video_rotation(self.media_path)
+            # Check for Variable Frame Rate (VFR) and warn the user
+            misc_helpers.check_and_warn_vfr(self.media_path)
             main_window.video_processor.media_rotation = rotation_angle
             media_capture = cv2.VideoCapture(self.media_path)
+            # Explicitly enable OpenCV's auto-rotation to let it handle metadata natively
+            if hasattr(cv2, "CAP_PROP_ORIENTATION_AUTO"):
+                media_capture.set(cv2.CAP_PROP_ORIENTATION_AUTO, 1)
             if not media_capture.isOpened():
                 print(f"[ERROR] Error opening video {self.media_path}")
                 return  # If the video cannot be opened, exit the function
@@ -223,6 +368,8 @@ class TargetMediaCardButton(CardButton):
             self.media_capture = media_capture
             main_window.video_processor.fps = media_capture.get(cv2.CAP_PROP_FPS)
             main_window.video_processor.max_frame_number = max_frames_number
+            main_window.video_processor.current_frame_number = 0
+            main_window.video_processor.next_frame_to_display = 0
 
         elif self.file_type == "image":
             frame = misc_helpers.read_image_file(self.media_path)
@@ -237,6 +384,13 @@ class TargetMediaCardButton(CardButton):
             ].split("x")
 
             media_capture = cv2.VideoCapture(self.webcam_index, self.webcam_backend)
+
+            try:
+                fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+                media_capture.set(cv2.CAP_PROP_FOURCC, fourcc)
+            except Exception:
+                pass
+
             media_capture.set(cv2.CAP_PROP_FRAME_WIDTH, int(res_width))
             media_capture.set(cv2.CAP_PROP_FRAME_HEIGHT, int(res_height))
             max_frames_number = 999999
@@ -277,7 +431,7 @@ class TargetMediaCardButton(CardButton):
 
         # Set Parameter widget values to default
         common_widget_actions.set_widgets_values_using_face_id_parameters(
-            main_window=main_window, face_id=False
+            main_window=main_window, face_id=None
         )
 
         main_window.loading_new_media = True
@@ -304,6 +458,11 @@ class TargetMediaCardButton(CardButton):
         # list_view_actions.find_target_faces(main_window)
 
     def deselect_currently_selected_video(self, main_window):
+        if video_control_actions.block_if_issue_scan_active(
+            main_window, "deselect the current media"
+        ):
+            return
+
         # Deselect the currently selected video
         if main_window.selected_video_button == self:
             self.reset_media_state()
@@ -312,7 +471,7 @@ class TargetMediaCardButton(CardButton):
             main_window.video_processor.current_frame_number = 0
             main_window.video_processor.media_path = False
             main_window.parameters = {}
-            main_window.selected_target_face_id = False
+            main_window.selected_target_face_id = None
 
             main_window.video_processor.media_capture = False
             main_window.video_processor.current_frame = []
@@ -355,11 +514,19 @@ class TargetMediaCardButton(CardButton):
 
     def remove_target_media_from_list(self):
         main_window = self.main_window
+        if video_control_actions.block_if_issue_scan_active(
+            main_window, "remove target media"
+        ):
+            return
         self.deselect_currently_selected_video(main_window)
         self.deleteLater()
 
     def delete_target_media_to_trash(self):
         main_window = self.main_window
+        if video_control_actions.block_if_issue_scan_active(
+            main_window, "delete target media"
+        ):
+            return
         self.deselect_currently_selected_video(main_window)
 
         # Send the file to the trash
@@ -380,11 +547,11 @@ class TargetMediaCardButton(CardButton):
                 # Windows - use full path to explorer.exe to avoid PATH issues
                 try:
                     # Method 1: Using subprocess without shell (more secure and reliable)
-                    subprocess.Popen(["explorer", "/select,", normalized_path])
+                    subprocess.Popen(f'explorer /select,"{normalized_path}"')
                 except FileNotFoundError:
                     # Fallback: Use full path to explorer.exe
                     subprocess.Popen(
-                        [r"C:\Windows\explorer.exe", "/select,", normalized_path]
+                        f'C:\\Windows\\explorer.exe /select,"{normalized_path}"'
                     )
             elif sys.platform == "darwin":
                 # macOS
@@ -395,22 +562,46 @@ class TargetMediaCardButton(CardButton):
                 subprocess.run(["xdg-open", directory])
 
     def create_context_menu(self):
+        from app.ui.widgets.actions import list_view_actions
+
         self.popMenu = QtWidgets.QMenu(self)
-        remove_action = QtGui.QAction("Remove from list", self)
-        remove_action.triggered.connect(self.remove_target_media_from_list)
-        self.popMenu.addAction(remove_action)
+        self.remove_action = QtGui.QAction("Remove from list", self)
+        self.remove_action.triggered.connect(self.remove_target_media_from_list)
+        self.popMenu.addAction(self.remove_action)
 
-        delete_action = QtGui.QAction("Delete file to recycle bin", self)
-        delete_action.triggered.connect(self.delete_target_media_to_trash)
-        self.popMenu.addAction(delete_action)
+        self.delete_action = QtGui.QAction("Delete file to recycle bin", self)
+        self.delete_action.triggered.connect(self.delete_target_media_to_trash)
+        self.popMenu.addAction(self.delete_action)
 
-        open_path_action = QtGui.QAction("Open file location", self)
-        open_path_action.triggered.connect(self.open_target_path_by_explorer)
-        self.popMenu.addAction(open_path_action)
+        self.open_path_action = QtGui.QAction("Open file location", self)
+        self.open_path_action.triggered.connect(self.open_target_path_by_explorer)
+        self.popMenu.addAction(self.open_path_action)
+        self.popMenu.addSeparator()
+
+        self.clear_all_media_action = QtGui.QAction("Clear All Media", self)
+        self.clear_all_media_action.triggered.connect(
+            partial(list_view_actions.clear_all_target_media, self.main_window)
+        )
+        self.popMenu.addAction(self.clear_all_media_action)
 
     def on_context_menu(self, point):
         # show context menu
-        self.popMenu.exec_(self.mapToGlobal(point))
+        self.create_context_menu()
+        try:
+            scan_active = video_control_actions.is_issue_scan_active(self.main_window)
+            self.remove_action.setEnabled(not scan_active)
+            self.delete_action.setEnabled(not scan_active)
+            self.clear_all_media_action.setEnabled(
+                bool(self.main_window.target_videos) and not scan_active
+            )
+            self._exec_context_menu(point)
+        finally:
+            self._release_context_menu(
+                "remove_action",
+                "delete_action",
+                "open_path_action",
+                "clear_all_media_action",
+            )
 
 
 class TargetFaceCardButton(CardButton):
@@ -447,22 +638,37 @@ class TargetFaceCardButton(CardButton):
         ] = {}  # Key: embedding_swap_model, Value: np.ndarray
         self.assigned_kv_map: Dict | None = None
 
-        self.setCheckable(True)
-        self.clicked.connect(self.load_target_face)
+        # Face re-aging: aged versions of embedding/KV map (populated by Apply button)
+        self.aged_input_embedding: Dict[str, np.ndarray] = {}
+        self.aged_kv_map: Dict | None = None
 
-        # Imposta lo stylesheet solo per questo pulsante
-        self.setStyleSheet("""
-        CardButton:checked {
-            background-color: #555555;
-            border: 2px solid #1abc9c;
-        }
-        """)
+        # Auto-mouth expression: per-face EMA state
+        from app.processors.mouth_openness import MouthOpennessState
+
+        self.mouth_openness_state: MouthOpennessState = MouthOpennessState()
+
+        self.setCheckable(True)
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(1)
+
+        self.display_label = QtWidgets.QLabel("", self)
+        self.display_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignBottom)
+        title_font = self.display_label.font()
+        title_font.setPointSize(9)
+        title_font.setBold(True)
+        self.display_label.setFont(title_font)
+        self.display_label.setAttribute(
+            QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
+        )
+        layout.addStretch(1)
+        layout.addWidget(self.display_label)
+        self.clicked.connect(self.load_target_face)
 
         # Set the context menu policy to trigger the custom context menu on right-click
         self.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         # Connect the custom context menu request signal to the custom slot
         self.customContextMenuRequested.connect(self.on_context_menu)
-        self.create_context_menu()
 
         # Create parameter dict for the target
         if not self.main_window.parameters.get(self.face_id):
@@ -538,9 +744,7 @@ class TargetFaceCardButton(CardButton):
                 )
 
                 # Get the similarity type from global controls
-                similarity_type = self.main_window.control.get(
-                    "SimilarityTypeSelection", "Opal"
-                )
+                similarity_type = str("Auto")
 
                 # Call run_recognize_direct (which expects CHW tensor)
                 new_embedding, _ = (
@@ -627,6 +831,8 @@ class TargetFaceCardButton(CardButton):
 
         main_window.selected_target_face_id = self.face_id
         main_window.current_kv_tensors_map = self.assigned_kv_map
+        video_control_actions.refresh_issue_frames_for_selected_face(main_window)
+        video_control_actions.update_scan_review_button_states(main_window)
 
         common_widget_actions.set_widgets_values_using_face_id_parameters(
             main_window=main_window, face_id=self.face_id
@@ -656,30 +862,27 @@ class TargetFaceCardButton(CardButton):
 
         # Calcolo degli embedding se presenti
         if len(all_input_embeddings) > 0:
-            if control["EmbMergeMethodSelection"] == "Mean":
-                self.assigned_input_embedding = {
-                    model: np.mean(
-                        [
-                            store[model]
-                            for store in all_input_embeddings
-                            if model in store
-                        ],
-                        axis=0,
-                    )
-                    for model in all_embedding_swap_models
-                }
-            elif control["EmbMergeMethodSelection"] == "Median":
-                self.assigned_input_embedding = {
-                    model: np.median(
-                        [
-                            store[model]
-                            for store in all_input_embeddings
-                            if model in store
-                        ],
-                        axis=0,
-                    )
-                    for model in all_embedding_swap_models
-                }
+            self.assigned_input_embedding = {}
+            for model in all_embedding_swap_models:
+                # Gather all embeddings for the current swap model
+                embeddings_to_merge = [
+                    store[model] for store in all_input_embeddings if model in store
+                ]
+
+                # 1. Apply Mean or Median
+                if control["EmbMergeMethodSelection"] == "Mean":
+                    merged_emb = np.mean(embeddings_to_merge, axis=0)
+                elif control["EmbMergeMethodSelection"] == "Median":
+                    merged_emb = np.median(embeddings_to_merge, axis=0)
+                else:
+                    merged_emb = np.mean(embeddings_to_merge, axis=0)  # Fallback
+
+                # 2. Apply L2 Normalization
+                norm = np.linalg.norm(merged_emb)
+                if norm > 0:
+                    merged_emb = merged_emb / norm
+
+                self.assigned_input_embedding[model] = merged_emb
 
         else:
             self.assigned_input_embedding = {}
@@ -696,95 +899,146 @@ class TargetFaceCardButton(CardButton):
         self.assigned_kv_map = None
         self.kv_data_color_transferred = False
 
-        if denoiser_on and self.assigned_input_faces:
-            first_input_face_id = list(self.assigned_input_faces.keys())[0]
-            input_face_button = main_window.input_faces.get(first_input_face_id)
+        if denoiser_on and (
+            self.assigned_input_faces or self.assigned_merged_embeddings
+        ):
+            all_kv_maps = []
 
-            if input_face_button:
-                # This lock ensures that only one thread (either the main thread
-                # during job loading, or a FrameWorker) can
-                # check the cache and generate the K/V map at a time.
-                with main_window.models_processor.kv_extraction_lock:
-                    # 1. Check the cache *inside* the lock.
-                    # If another thread generated it while we were waiting,
-                    # we can use it directly.
-                    if (
-                        hasattr(input_face_button, "kv_map")
-                        and input_face_button.kv_map is not None
-                    ):
-                        # Cache found! Assign and exit the lock.
-                        self.assigned_kv_map = input_face_button.kv_map
-                    else:
-                        # Cache missing. We are the first thread.
-                        # Generate, cache, and assign the map.
-                        print(
-                            f"[INFO] Generating K/V map for input face: {input_face_button.media_path}"
-                        )
-                        try:
-                            from PIL import Image
+            # 1. Embeddings priority
+            for embedding_id in self.assigned_merged_embeddings.keys():
+                embed_button = main_window.merged_embeddings.get(embedding_id)
+                if not embed_button:
+                    continue
 
-                            models_processor = main_window.models_processor
+                # Check if the embedding has a pre-generated KV map
+                if (
+                    hasattr(embed_button, "kv_map")
+                    and embed_button.kv_map is not None
+                    and len(embed_button.kv_map) > 0
+                ):
+                    all_kv_maps.append(embed_button.kv_map)
 
-                            # Prepare the image for the extractor
-                            cropped_face_np = (
-                                input_face_button.cropped_face
-                            )  # BGR Numpy
-                            pil_img = Image.fromarray(
-                                cropped_face_np[..., ::-1]
-                            )  # RGB PIL
+            # 2. Fallback to Input Faces
+            if len(all_kv_maps) == 0:
+                for input_face_id in self.assigned_input_faces.keys():
+                    input_face_button = main_window.input_faces.get(input_face_id)
+                    if not input_face_button:
+                        continue
 
-                            if pil_img.size != (512, 512):
-                                pil_img = pil_img.resize(
-                                    (512, 512), Image.Resampling.LANCZOS
-                                )
+                    with main_window.models_processor.kv_extraction_lock:
+                        if (
+                            hasattr(input_face_button, "kv_map")
+                            and input_face_button.kv_map is not None
+                            and len(input_face_button.kv_map) > 0
+                        ):
+                            all_kv_maps.append(input_face_button.kv_map)
+                        else:
+                            print(
+                                f"[INFO] Generating K/V map for input face: {input_face_button.media_path}"
+                            )
+                            try:
+                                from PIL import Image
 
-                            # Call the function (which no longer has an internal lock)
-                            # It will load, extract, AND unload.
-                            kv_map = models_processor.get_kv_map_for_face(pil_img)
+                                models_processor = main_window.models_processor
+                                cropped_face_np = input_face_button.cropped_face
+                                pil_img = Image.fromarray(cropped_face_np[..., ::-1])
 
-                            # Cache and assign
-                            input_face_button.kv_map = kv_map
-                            self.assigned_kv_map = kv_map
-                            print("[INFO] Generated and cached K/V map.")
+                                if pil_img.size != (512, 512):
+                                    pil_img = pil_img.resize(
+                                        (512, 512), Image.Resampling.LANCZOS
+                                    )
 
-                        except Exception as e:
-                            print(f"[ERROR] Error generating K/V map: {e}")
-                            traceback.print_exc()
-                            input_face_button.kv_map = {}  # Empty cache in case of error
-                            self.assigned_kv_map = {}
+                                kv_map = models_processor.get_kv_map_for_face(pil_img)
+
+                                if kv_map:
+                                    input_face_button.kv_map = kv_map
+                                    all_kv_maps.append(kv_map)
+                                    print("[INFO] Generated and cached K/V map.")
+                                else:
+                                    input_face_button.kv_map = {}
+                            except Exception as e:
+                                print(f"[ERROR] Error generating K/V map: {e}")
+                                import traceback
+
+                                traceback.print_exc()
+                                input_face_button.kv_map = {}
+
+            # 3. Merge all collected KV Maps
+            if all_kv_maps:
+                if len(all_kv_maps) == 1:
+                    self.assigned_kv_map = all_kv_maps[0]
+                else:
+                    print(
+                        f"[INFO] Merging K/V maps across {len(all_kv_maps)} prioritized sources..."
+                    )
+                    merged_kv_map = {}
+                    first_map = all_kv_maps[0]
+
+                    for layer_key, layer_dict in first_map.items():
+                        merged_kv_map[layer_key] = {}
+                        for kv_key in layer_dict.keys():
+                            tensors_to_merge = []
+                            for m in all_kv_maps:
+                                if layer_key in m and kv_key in m[layer_key]:
+                                    tensors_to_merge.append(m[layer_key][kv_key])
+
+                            if tensors_to_merge:
+                                stacked = torch.stack(tensors_to_merge, dim=0)
+                                merged_tensor = torch.mean(stacked, dim=0)
+                                merged_kv_map[layer_key][kv_key] = merged_tensor
+
+                    self.assigned_kv_map = merged_kv_map
+            else:
+                self.assigned_kv_map = None
 
         if main_window.selected_target_face_id == self.face_id:
             main_window.current_kv_tensors_map = self.assigned_kv_map
 
+        # Dirty Flag
+        if (
+            hasattr(self.main_window, "video_processor")
+            and self.main_window.video_processor
+        ):
+            self.main_window.video_processor.ui_state_is_dirty = True
+
     def create_context_menu(self):
         # create context menu
+        from app.ui.widgets.actions import list_view_actions
+
         self.popMenu = QtWidgets.QMenu(self)
-        parameters_copy_action = QtGui.QAction("Copy Parameters", self)
-        parameters_copy_action.triggered.connect(self.copy_parameters)
-        parameters_paste_action = QtGui.QAction("Apply Copied Parameters", self)
-        parameters_paste_action.triggered.connect(self.paste_and_apply_parameters)
-        save_parameters_action = QtGui.QAction(
-            "Save Current Parameters and Settings", self
+        self.face_header_action = QtGui.QAction(self.get_display_label(), self)
+        header_font = self.popMenu.font()
+        header_font.setBold(True)
+        self.face_header_action.setFont(header_font)
+        self.face_header_action.setEnabled(False)
+        self.popMenu.addAction(self.face_header_action)
+        self.popMenu.addSeparator()
+        self.parameters_copy_action = QtGui.QAction("Copy Parameters", self)
+        self.parameters_copy_action.triggered.connect(self.copy_parameters)
+        self.parameters_paste_action = QtGui.QAction("Paste Parameters", self)
+        self.parameters_paste_action.triggered.connect(self.paste_and_apply_parameters)
+        self.save_parameters_action = QtGui.QAction(
+            "Save Parameters and Settings", self
         )
-        save_parameters_action.triggered.connect(
+        self.save_parameters_action.triggered.connect(
             partial(
                 save_load_actions.save_current_parameters_and_control,
                 self.main_window,
                 self.face_id,
             )
         )
-        load_parameters_action = QtGui.QAction("Load Parameters", self)
-        load_parameters_action.triggered.connect(
+        self.load_parameters_action = QtGui.QAction("Load Parameters Only", self)
+        self.load_parameters_action.triggered.connect(
             partial(
                 save_load_actions.load_parameters_and_settings,
                 self.main_window,
                 self.face_id,
             )
         )
-        load_parameters_and_settings_action = QtGui.QAction(
+        self.load_parameters_and_settings_action = QtGui.QAction(
             "Load Parameters and Settings", self
         )
-        load_parameters_and_settings_action.triggered.connect(
+        self.load_parameters_and_settings_action.triggered.connect(
             partial(
                 save_load_actions.load_parameters_and_settings,
                 self.main_window,
@@ -792,21 +1046,79 @@ class TargetFaceCardButton(CardButton):
                 True,
             )
         )
-        remove_action = QtGui.QAction("Remove from List", self)
-        remove_action.triggered.connect(self.remove_target_face_from_list)
-        self.popMenu.addAction(parameters_copy_action)
-        self.popMenu.addAction(parameters_paste_action)
-        self.popMenu.addAction(save_parameters_action)
-        self.popMenu.addAction(load_parameters_action)
-        self.popMenu.addAction(load_parameters_and_settings_action)
-        self.popMenu.addAction(remove_action)
+        current_face_size = getattr(
+            self.main_window, "face_thumbnail_button_size", None
+        )
+        self.thumbnail_size_action_group = QtGui.QActionGroup(self.popMenu)
+        self.thumbnail_size_action_group.setExclusive(True)
+
+        self.small_thumbnails_action = QtGui.QAction("Small Thumbnails", self)
+        self.small_thumbnails_action.setCheckable(True)
+        self.small_thumbnails_action.setChecked(current_face_size == (70, 70))
+        self.thumbnail_size_action_group.addAction(self.small_thumbnails_action)
+        self.small_thumbnails_action.triggered.connect(
+            partial(
+                list_view_actions.apply_face_thumbnail_size, self.main_window, (70, 70)
+            )
+        )
+        self.large_thumbnails_action = QtGui.QAction("Large Thumbnails", self)
+        self.large_thumbnails_action.setCheckable(True)
+        self.large_thumbnails_action.setChecked(current_face_size == (96, 96))
+        self.thumbnail_size_action_group.addAction(self.large_thumbnails_action)
+        self.large_thumbnails_action.triggered.connect(
+            partial(
+                list_view_actions.apply_face_thumbnail_size, self.main_window, (96, 96)
+            )
+        )
+        self.remove_action = QtGui.QAction("Remove from List", self)
+        self.remove_action.triggered.connect(self.remove_target_face_from_list)
+        self.popMenu.addAction(self.parameters_copy_action)
+        self.popMenu.addAction(self.parameters_paste_action)
+        self.popMenu.addAction(self.save_parameters_action)
+        self.popMenu.addAction(self.load_parameters_action)
+        self.popMenu.addAction(self.load_parameters_and_settings_action)
+        self.popMenu.addSeparator()
+        self.popMenu.addAction(self.small_thumbnails_action)
+        self.popMenu.addAction(self.large_thumbnails_action)
+        self.popMenu.addSeparator()
+        self.popMenu.addAction(self.remove_action)
 
     def on_context_menu(self, point):
         # show context menu
-        self.popMenu.exec_(self.mapToGlobal(point))
+        self.create_context_menu()
+        try:
+            scan_active = video_control_actions.is_issue_scan_active(self.main_window)
+            current_face_size = getattr(
+                self.main_window, "face_thumbnail_button_size", None
+            )
+            self.face_header_action.setText(self.get_display_label())
+            self.parameters_paste_action.setEnabled(not scan_active)
+            self.load_parameters_action.setEnabled(not scan_active)
+            self.load_parameters_and_settings_action.setEnabled(not scan_active)
+            self.remove_action.setEnabled(not scan_active)
+            self.small_thumbnails_action.setChecked(current_face_size == (70, 70))
+            self.large_thumbnails_action.setChecked(current_face_size == (96, 96))
+            self._exec_context_menu(point)
+        finally:
+            self._release_context_menu(
+                "face_header_action",
+                "parameters_copy_action",
+                "parameters_paste_action",
+                "save_parameters_action",
+                "load_parameters_action",
+                "load_parameters_and_settings_action",
+                "thumbnail_size_action_group",
+                "small_thumbnails_action",
+                "large_thumbnails_action",
+                "remove_action",
+            )
 
     def remove_target_face_from_list(self):
         main_window = self.main_window
+        if video_control_actions.block_if_issue_scan_active(
+            main_window, "remove a target face"
+        ):
+            return
 
         if main_window.video_processor.processing:
             main_window.video_processor.stop_processing()
@@ -814,8 +1126,13 @@ class TargetFaceCardButton(CardButton):
         i = self.get_item_position()
         main_window.targetFacesList.takeItem(i)
         main_window.target_faces.pop(self.face_id)
+        from app.ui.widgets.actions import list_view_actions
+
+        list_view_actions.refresh_target_face_display_labels(main_window)
         # Pop parameters using the target's face_id
         main_window.parameters.pop(self.face_id)
+        if hasattr(main_window, "issue_frames_by_face"):
+            main_window.issue_frames_by_face.pop(str(self.face_id), None)
         # Click and Select the first target face if target_faces are not empty
         if main_window.target_faces:
             list(main_window.target_faces.values())[0].click()
@@ -823,15 +1140,45 @@ class TargetFaceCardButton(CardButton):
         # Otherwise reset parameter widgets value to the default
         else:
             common_widget_actions.set_widgets_values_using_face_id_parameters(
-                main_window, face_id=False
+                main_window, face_id=None
             )
-            main_window.selected_target_face_id = False
-
+            main_window.selected_target_face_id = None
+            video_control_actions.refresh_issue_frames_for_selected_face(main_window)
+        video_control_actions.update_scan_review_button_states(main_window)
         video_control_actions.remove_face_parameters_and_control_from_markers(
             main_window, self.face_id
         )  # Remove parameters for the face from all markers
         common_widget_actions.refresh_frame(self.main_window)
+
+        # Explicitly release large data before Qt schedules widget destruction.
+        # KV maps can be 10-100 MB; embeddings are smaller but numpy arrays that
+        # benefit from prompt deallocation. deleteLater() only schedules the C++
+        # widget object; Python-side attributes survive until GC runs otherwise.
+        self.assigned_kv_map = None
+        self.aged_kv_map = None
+        self.assigned_input_embedding.clear()
+        self.aged_input_embedding.clear()
+        self.embedding_store.clear()
+        self.assigned_input_faces.clear()
+        self.assigned_merged_embeddings.clear()
+
         self.deleteLater()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def get_display_label(self) -> str:
+        item_position = self.get_item_position()
+        if item_position is None:
+            return "Face"
+        return f"Face {item_position + 1}"
+
+    def refresh_display_label(self):
+        display_label = self.get_display_label()
+        self.display_label.setText(display_label)
+        face_header_action = getattr(self, "face_header_action", None)
+        if face_header_action is not None:
+            face_header_action.setText(display_label)
 
     def remove_assigned_input_face(self, input_face_id):
         if self.assigned_input_faces.get(input_face_id):
@@ -844,26 +1191,14 @@ class TargetFaceCardButton(CardButton):
             self.calculate_assigned_input_embedding()
 
     def copy_parameters(self):
-        self.main_window.copied_parameters = self.main_window.parameters[
-            self.face_id
-        ].copy()
+        common_widget_actions.copy_selected_face_parameters(
+            self.main_window, self.face_id
+        )
 
     def paste_and_apply_parameters(self):
-        if not self.main_window.copied_parameters:
-            common_widget_actions.create_and_show_messagebox(
-                self.main_window,
-                "No parameters found in Clipboard",
-                "You need to copy parameters from any of the target face before pasting it!",
-                parent_widget=self,
-            )
-        else:
-            self.main_window.parameters[self.face_id] = (
-                self.main_window.copied_parameters.copy()
-            )
-            common_widget_actions.set_widgets_values_using_face_id_parameters(
-                self.main_window, face_id=self.face_id
-            )
-            common_widget_actions.refresh_frame(main_window=self.main_window)
+        common_widget_actions.paste_selected_face_parameters(
+            self.main_window, self.face_id
+        )
 
 
 class InputFaceCardButton(CardButton):
@@ -889,19 +1224,10 @@ class InputFaceCardButton(CardButton):
         self.setToolTip(media_path)
         self.clicked.connect(self.load_input_face)
 
-        # Imposta lo stylesheet solo per questo pulsante
-        self.setStyleSheet("""
-        CardButton:checked {
-            background-color: #555555;
-            border: 2px solid #1abc9c;
-        }
-        """)
-
         # Set the context menu policy to trigger the custom context menu on right-click
         self.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         # Connect the custom context menu request signal to the custom slot
         self.customContextMenuRequested.connect(self.on_context_menu)
-        self.create_context_menu()
 
     def set_embedding(self, embedding_swap_model: str, embedding: np.ndarray):
         self.embedding_store[embedding_swap_model] = embedding
@@ -911,6 +1237,11 @@ class InputFaceCardButton(CardButton):
 
     def load_input_face(self):
         main_window = self.main_window
+        if video_control_actions.block_if_issue_scan_active(
+            main_window, "change input-face assignments"
+        ):
+            self._restore_pre_click_checked_state()
+            return
 
         if main_window.cur_selected_target_face_button:
             cur_selected_target_face_button = (
@@ -980,6 +1311,10 @@ class InputFaceCardButton(CardButton):
             if not self.isChecked():
                 cur_selected_target_face_button.assigned_input_faces.pop(self.face_id)
             cur_selected_target_face_button.calculate_assigned_input_embedding()
+            if not self.isChecked():
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
         else:
             if (
                 not QtWidgets.QApplication.keyboardModifiers()
@@ -1035,6 +1370,10 @@ class InputFaceCardButton(CardButton):
 
     def remove_input_face_from_list(self):
         main_window = self.main_window
+        if video_control_actions.block_if_issue_scan_active(
+            main_window, "remove input faces"
+        ):
+            return
         faces_to_remove = [
             face_button
             for _, face_button in main_window.input_faces.items()
@@ -1060,6 +1399,10 @@ class InputFaceCardButton(CardButton):
 
     def delete_input_face_to_trash(self):
         main_window = self.main_window
+        if video_control_actions.block_if_issue_scan_active(
+            main_window, "delete input faces"
+        ):
+            return
         self.remove_kv_data_file()
         self._remove_face_from_lists()
 
@@ -1085,11 +1428,11 @@ class InputFaceCardButton(CardButton):
                 # Windows - use full path to explorer.exe to avoid PATH issues
                 try:
                     # Method 1: Using subprocess without shell (more secure and reliable)
-                    subprocess.Popen(["explorer", "/select,", normalized_path])
+                    subprocess.Popen(f'explorer /select,"{normalized_path}"')
                 except FileNotFoundError:
                     # Fallback: Use full path to explorer.exe
                     subprocess.Popen(
-                        [r"C:\Windows\explorer.exe", "/select,", normalized_path]
+                        f'C:\\Windows\\explorer.exe /select,"{normalized_path}"'
                     )
             elif sys.platform == "darwin":
                 # macOS
@@ -1101,39 +1444,110 @@ class InputFaceCardButton(CardButton):
 
     def create_context_menu(self):
         # create context menu
+        from app.ui.widgets.actions import list_view_actions
+
         self.popMenu = QtWidgets.QMenu(self)
-        create_embed_action = QtGui.QAction(
+        self.create_embed_action = QtGui.QAction(
             "Create embedding from selected faces", self
         )
-        create_embed_action.triggered.connect(self.create_embedding_from_selected_faces)
-        self.popMenu.addAction(create_embed_action)
+        self.create_embed_action.triggered.connect(
+            self.create_embedding_from_selected_faces
+        )
+        self.popMenu.addAction(self.create_embed_action)
 
-        remove_action = QtGui.QAction("Remove from list", self)
-        remove_action.triggered.connect(self.remove_input_face_from_list)
-        self.popMenu.addAction(remove_action)
+        self.remove_action = QtGui.QAction("Remove from list", self)
+        self.remove_action.triggered.connect(self.remove_input_face_from_list)
+        self.popMenu.addAction(self.remove_action)
 
-        delete_action = QtGui.QAction("Delete file to recycle bin", self)
-        delete_action.triggered.connect(self.delete_input_face_to_trash)
-        self.popMenu.addAction(delete_action)
+        self.delete_action = QtGui.QAction("Delete file to recycle bin", self)
+        self.delete_action.triggered.connect(self.delete_input_face_to_trash)
+        self.popMenu.addAction(self.delete_action)
 
-        open_path_action = QtGui.QAction("Open file location", self)
-        open_path_action.triggered.connect(self.open_target_path_by_explorer)
-        self.popMenu.addAction(open_path_action)
+        self.open_path_action = QtGui.QAction("Open file location", self)
+        self.open_path_action.triggered.connect(self.open_target_path_by_explorer)
+        self.popMenu.addAction(self.open_path_action)
+        self.popMenu.addSeparator()
+
+        current_face_size = getattr(
+            self.main_window, "face_thumbnail_button_size", None
+        )
+        self.thumbnail_size_action_group = QtGui.QActionGroup(self.popMenu)
+        self.thumbnail_size_action_group.setExclusive(True)
+
+        self.small_thumbnails_action = QtGui.QAction("Small Thumbnails", self)
+        self.small_thumbnails_action.setCheckable(True)
+        self.small_thumbnails_action.setChecked(current_face_size == (70, 70))
+        self.thumbnail_size_action_group.addAction(self.small_thumbnails_action)
+        self.small_thumbnails_action.triggered.connect(
+            partial(
+                list_view_actions.apply_face_thumbnail_size, self.main_window, (70, 70)
+            )
+        )
+        self.popMenu.addAction(self.small_thumbnails_action)
+
+        self.large_thumbnails_action = QtGui.QAction("Large Thumbnails", self)
+        self.large_thumbnails_action.setCheckable(True)
+        self.large_thumbnails_action.setChecked(current_face_size == (96, 96))
+        self.thumbnail_size_action_group.addAction(self.large_thumbnails_action)
+        self.large_thumbnails_action.triggered.connect(
+            partial(
+                list_view_actions.apply_face_thumbnail_size, self.main_window, (96, 96)
+            )
+        )
+        self.popMenu.addAction(self.large_thumbnails_action)
+        self.popMenu.addSeparator()
+
+        self.clear_all_faces_action = QtGui.QAction("Clear All Faces", self)
+        self.clear_all_faces_action.triggered.connect(
+            partial(list_view_actions.clear_all_input_faces, self.main_window)
+        )
+        self.popMenu.addAction(self.clear_all_faces_action)
 
     def on_context_menu(self, point):
         # show context menu
-        self.popMenu.exec_(self.mapToGlobal(point))
+        self.create_context_menu()
+        try:
+            scan_active = video_control_actions.is_issue_scan_active(self.main_window)
+            current_face_size = getattr(
+                self.main_window, "face_thumbnail_button_size", None
+            )
+            self.create_embed_action.setEnabled(not scan_active)
+            self.remove_action.setEnabled(not scan_active)
+            self.delete_action.setEnabled(not scan_active)
+            self.small_thumbnails_action.setChecked(current_face_size == (70, 70))
+            self.large_thumbnails_action.setChecked(current_face_size == (96, 96))
+            self.clear_all_faces_action.setEnabled(
+                bool(self.main_window.input_faces) and not scan_active
+            )
+            self._exec_context_menu(point)
+        finally:
+            self._release_context_menu(
+                "create_embed_action",
+                "remove_action",
+                "delete_action",
+                "open_path_action",
+                "thumbnail_size_action_group",
+                "small_thumbnails_action",
+                "large_thumbnails_action",
+                "clear_all_faces_action",
+            )
 
     def create_embedding_from_selected_faces(self):
-        # Raccogli l'intero embedding_store dalle facce selezionate
-        selected_faces_embeddings_store = [
-            input_face.embedding_store
+        if video_control_actions.block_if_issue_scan_active(
+            self.main_window, "create embeddings"
+        ):
+            return
+
+        # Raccogli i bottoni (oggetti) invece che solo gli store.
+        # Abbiamo bisogno del 'cropped_face' per estrarre le KV map.
+        selected_faces = [
+            input_face
             for _, input_face in self.main_window.input_faces.items()
             if input_face.isChecked()
         ]
 
         # Controlla se ci sono facce selezionate
-        if len(selected_faces_embeddings_store) == 0:
+        if len(selected_faces) == 0:
             common_widget_actions.create_and_show_messagebox(
                 self.main_window,
                 "No Faces Selected!",
@@ -1141,9 +1555,9 @@ class InputFaceCardButton(CardButton):
                 self,
             )
         else:
-            # Passa l'intero embedding_store al dialogo per la creazione dell'embedding
+            # Passa i bottoni completi al dialogo
             embed_create_dialog = CreateEmbeddingDialog(
-                self.main_window, selected_faces_embeddings_store
+                self.main_window, selected_faces
             )
             embed_create_dialog.exec_()
 
@@ -1163,24 +1577,39 @@ class EmbeddingCardButton(CardButton):
             embedding_store  # Key: embedding_swap_model, Value: embedding
         )
         self.embedding_name = embedding_name
+
+        self._kv_map: Dict | None = None
+
         self.setCheckable(True)
         self.setText(embedding_name)
         self.setToolTip(embedding_name)
         self.clicked.connect(self.load_embedding)
 
-        # Imposta lo stylesheet solo per questo pulsante
-        self.setStyleSheet("""
-        CardButton:checked {
-            background-color: #555555;
-            border: 2px solid #1abc9c;
-        }
-        """)
-
         # Set the context menu policy to trigger the custom context menu on right-click
         self.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         # Connect the custom context menu request signal to the custom slot
         self.customContextMenuRequested.connect(self.on_context_menu)
-        self.create_context_menu()
+
+    # --- Property definitions to intercept when a K/V map is assigned ---
+    @property
+    def kv_map(self):
+        """Getter for the K/V map."""
+        return self._kv_map
+
+    @kv_map.setter
+    def kv_map(self, value):
+        """Setter for the K/V map. Updates the UI color automatically."""
+        self._kv_map = value
+
+        # If valid tensors are loaded, change the text color to red and update tooltip
+        if self._kv_map is not None and len(self._kv_map) > 0:
+            # Using the UI's native accent color (#4090a3) for consistency
+            self.setStyleSheet("color: #4090a3;")
+            self.setToolTip(f"{self.embedding_name} (Includes K/V Maps)")
+        else:
+            # Reset to default UI style
+            self.setStyleSheet("")
+            self.setToolTip(self.embedding_name)
 
     def set_embedding(self, embedding_swap_model: str, embedding: np.ndarray):
         self.embedding_store[embedding_swap_model] = embedding
@@ -1191,6 +1620,12 @@ class EmbeddingCardButton(CardButton):
 
     def load_embedding(self):
         main_window = self.main_window
+        if video_control_actions.block_if_issue_scan_active(
+            main_window, "change merged-embedding assignments"
+        ):
+            self._restore_pre_click_checked_state()
+            return
+
         if main_window.cur_selected_target_face_button:
             cur_selected_target_face_button = (
                 main_window.cur_selected_target_face_button
@@ -1216,6 +1651,10 @@ class EmbeddingCardButton(CardButton):
                     self.embedding_id
                 )
             cur_selected_target_face_button.calculate_assigned_input_embedding()
+            if not self.isChecked():
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
         else:
             if (
                 not QtWidgets.QApplication.keyboardModifiers()
@@ -1230,16 +1669,42 @@ class EmbeddingCardButton(CardButton):
 
     def create_context_menu(self):
         # create context menu
+        from app.ui.widgets.actions import list_view_actions
+
         self.popMenu = QtWidgets.QMenu(self)
-        remove_action = QtGui.QAction("Remove Embedding", self)
-        remove_action.triggered.connect(self.remove_embedding_from_list)
-        self.popMenu.addAction(remove_action)
+        self.remove_action = QtGui.QAction("Remove Embedding", self)
+        self.remove_action.triggered.connect(self.remove_embedding_from_list)
+        self.popMenu.addAction(self.remove_action)
+        self.popMenu.addSeparator()
+
+        self.clear_all_embeddings_action = QtGui.QAction("Clear All Embeddings", self)
+        self.clear_all_embeddings_action.triggered.connect(
+            partial(list_view_actions.clear_all_embeddings, self.main_window)
+        )
+        self.popMenu.addAction(self.clear_all_embeddings_action)
 
     def on_context_menu(self, point):
         # show context menu
-        self.popMenu.exec_(self.mapToGlobal(point))
+        self.create_context_menu()
+        try:
+            scan_active = video_control_actions.is_issue_scan_active(self.main_window)
+            self.remove_action.setEnabled(not scan_active)
+            self.clear_all_embeddings_action.setEnabled(
+                bool(self.main_window.merged_embeddings) and not scan_active
+            )
+            self._exec_context_menu(point)
+        finally:
+            self._release_context_menu(
+                "remove_action",
+                "clear_all_embeddings_action",
+            )
 
     def remove_embedding_from_list(self):
+        if video_control_actions.block_if_issue_scan_active(
+            self.main_window, "remove embeddings"
+        ):
+            return
+
         main_window = self.main_window
         for i in range(main_window.inputEmbeddingsList.count() - 1, -1, -1):
             list_item = main_window.inputEmbeddingsList.item(i)
@@ -1255,9 +1720,10 @@ class EmbeddingCardButton(CardButton):
 
 
 class CreateEmbeddingDialog(QtWidgets.QDialog):
-    def __init__(self, main_window: "MainWindow", embedding_stores: list | None = None):
+    def __init__(self, main_window: "MainWindow", selected_faces: list | None = None):
         super().__init__()
-        self.embedding_stores = embedding_stores or []
+        # InputFaceCardButton for acces to .cropped_face and .embedding_store
+        self.selected_faces = selected_faces or []
         self.main_window = main_window
         self.embedding_name = ""
         self.merge_type = ""
@@ -1274,6 +1740,17 @@ class CreateEmbeddingDialog(QtWidgets.QDialog):
             main_window.control["EmbMergeMethodSelection"]
         )
 
+        # Checkbox to optionally generate and include K/V maps
+        self.include_kv_checkbox = QtWidgets.QCheckBox(
+            "Generate and include K/V Maps (For Denoiser)", self
+        )
+        self.include_kv_checkbox.setChecked(
+            False
+        )  # Optional feature, default to false to save time
+        self.include_kv_checkbox.setToolTip(
+            "Will extract K/V Maps from selected faces and merge them. This might take a moment."
+        )
+
         # Create button box
         QBtn = QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
         self.buttonBox = QtWidgets.QDialogButtonBox(QBtn)
@@ -1286,6 +1763,7 @@ class CreateEmbeddingDialog(QtWidgets.QDialog):
         layout.addWidget(self.embed_name_edit)
         layout.addWidget(QtWidgets.QLabel("Merge Type:"))
         layout.addWidget(self.merge_type_selection)
+        layout.addWidget(self.include_kv_checkbox)
         layout.addWidget(self.buttonBox)
 
         # Set dialog layout
@@ -1302,34 +1780,138 @@ class CreateEmbeddingDialog(QtWidgets.QDialog):
                 "Embedding Name cannot be empty!",
                 self,
             )
-        else:
-            # Estrai tutti gli embedding per ogni embedding_swap_model
-            merged_embedding_store = {}
+            return
 
-            for embedding_store in self.embedding_stores:
-                for embedding_swap_model, embedding in embedding_store.items():
-                    if embedding_swap_model not in merged_embedding_store:
-                        merged_embedding_store[embedding_swap_model] = []
-                    merged_embedding_store[embedding_swap_model].append(embedding)
+        # 1. Classic embedding merge and KPS separation
+        merged_embedding_store = {}
+        kps_5_list = []  # List to safely collect spatial keypoints
 
-            # Calcola l'embedding unito per ciascun embedding_swap_model
-            final_embedding_store = {}
-            for swap_model, embeddings in merged_embedding_store.items():
-                if self.merge_type == "Mean":
-                    final_embedding_store[swap_model] = np.mean(embeddings, axis=0)
-                elif self.merge_type == "Median":
-                    final_embedding_store[swap_model] = np.median(embeddings, axis=0)
+        for input_face in self.selected_faces:
+            for embedding_swap_model, embedding in input_face.embedding_store.items():
+                # Isolate keypoints to prevent L2 Normalization (which destroys spatial pixel coordinates)
+                if embedding_swap_model == "kps_5":
+                    kps_5_list.append(embedding)
+                    continue
 
-            # Crea e aggiungi il nuovo embedding_store con tutti i modelli di swap
-            from app.ui.widgets.actions import list_view_actions
+                if embedding_swap_model not in merged_embedding_store:
+                    merged_embedding_store[embedding_swap_model] = []
+                merged_embedding_store[embedding_swap_model].append(embedding)
 
-            list_view_actions.create_and_add_embed_button_to_list(
-                main_window=self.main_window,
-                embedding_name=self.embedding_name,
-                embedding_store=final_embedding_store,  # Passa l'intero embedding_store
-                embedding_id=str(uuid.uuid1().int),
-            )
-            self.accept()
+        # Calculate the merged embedding for each arcface model
+        final_embedding_store = {}
+        for swap_model, embeddings in merged_embedding_store.items():
+            if self.merge_type == "Mean":
+                merged_emb = np.mean(embeddings, axis=0)
+            elif self.merge_type == "Median":
+                merged_emb = np.median(embeddings, axis=0)
+            else:
+                merged_emb = np.mean(embeddings, axis=0)  # Fallback
+
+            # Apply L2 Normalization ONLY to standard latent embeddings
+            norm = np.linalg.norm(merged_emb)
+            if norm > 0:
+                merged_emb = merged_emb / norm
+
+            final_embedding_store[swap_model] = merged_emb
+
+        # Process kps_5 spatial averaging (Always use Mean, never L2 Normalize)
+        if kps_5_list:
+            final_embedding_store["kps_5"] = np.mean(kps_5_list, axis=0)
+
+        # 2. Extract and merge K/V Maps (if checked)
+        final_kv_map = None
+        if self.include_kv_checkbox.isChecked():
+            all_kv_maps = []
+            import traceback
+            from PIL import Image
+
+            QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+
+            try:
+                for input_face in self.selected_faces:
+                    with self.main_window.models_processor.kv_extraction_lock:
+                        # Check Cache first
+                        if (
+                            hasattr(input_face, "kv_map")
+                            and input_face.kv_map is not None
+                            and len(input_face.kv_map) > 0
+                        ):
+                            all_kv_maps.append(input_face.kv_map)
+                        else:
+                            # Generate Cache
+                            print(
+                                f"[INFO] Dialog: Generating K/V map for {input_face.media_path}"
+                            )
+                            try:
+                                cropped_face_np = input_face.cropped_face
+                                pil_img = Image.fromarray(cropped_face_np[..., ::-1])
+                                if pil_img.size != (512, 512):
+                                    pil_img = pil_img.resize(
+                                        (512, 512), Image.Resampling.LANCZOS
+                                    )
+
+                                kv_map = self.main_window.models_processor.get_kv_map_for_face(
+                                    pil_img
+                                )
+
+                                if kv_map:
+                                    input_face.kv_map = kv_map
+                                    all_kv_maps.append(kv_map)
+                            except Exception as e:
+                                print(f"[ERROR] Error generating K/V map: {e}")
+                                traceback.print_exc()
+
+                if all_kv_maps:
+                    if len(all_kv_maps) == 1:
+                        final_kv_map = all_kv_maps[0]
+                    else:
+                        print(
+                            f"[INFO] Dialog: Merging K/V maps across {len(all_kv_maps)} faces..."
+                        )
+                        merged_kv_map = {}
+                        first_map = all_kv_maps[0]
+
+                        for layer_key, layer_dict in first_map.items():
+                            merged_kv_map[layer_key] = {}
+                            for kv_key in layer_dict.keys():
+                                tensors_to_merge = []
+                                for m in all_kv_maps:
+                                    if layer_key in m and kv_key in m[layer_key]:
+                                        tensors_to_merge.append(m[layer_key][kv_key])
+
+                                if tensors_to_merge:
+                                    import torch
+
+                                    stacked = torch.stack(tensors_to_merge, dim=0)
+                                    # Never use Median on spacial k/v -> always mean
+                                    merged_tensor = torch.mean(stacked, dim=0)
+                                    merged_kv_map[layer_key][kv_key] = merged_tensor
+
+                        final_kv_map = merged_kv_map
+            finally:
+                QtWidgets.QApplication.restoreOverrideCursor()
+
+        # 3. Button Creation and Injection
+        from app.ui.widgets.actions import list_view_actions
+
+        embedding_id = str(uuid.uuid1().int)
+
+        list_view_actions.create_and_add_embed_button_to_list(
+            main_window=self.main_window,
+            embedding_name=self.embedding_name,
+            embedding_store=final_embedding_store,
+            embedding_id=embedding_id,
+        )
+
+        # 4. Assign the K/V Map to the new button
+        if final_kv_map is not None:
+            if embedding_id in self.main_window.merged_embeddings:
+                self.main_window.merged_embeddings[embedding_id].kv_map = final_kv_map
+                print(
+                    f"[INFO] Successfully linked merged K/V map to embedding '{self.embedding_name}'."
+                )
+
+        self.accept()
 
 
 class LoadingDialog(QtWidgets.QDialog):
@@ -1377,7 +1959,139 @@ class LoadingDialog(QtWidgets.QDialog):
 
 # Custom progress dialog
 class ProgressDialog(QtWidgets.QProgressDialog):
-    pass
+    """
+    QProgressDialog with confirmation-before-cancel behavior that works with PySide6.
+
+    IMPORTANT:
+    - Do NOT rely on overriding cancel()/wasCanceled(); QProgressDialog's cancel is not virtual.
+    - Use the `canceled` signal to intercept cancellation.
+    - Batch code must check confirmedCanceled() instead of wasCanceled().
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self._confirmed_cancelled = False
+        self._confirm_dialog_open = False
+        self._confirmation_disabled = False
+
+        # Prevent Qt from auto-closing/resetting the dialog unexpectedly
+        try:
+            self.setAutoClose(False)
+        except Exception:
+            pass
+        try:
+            self.setAutoReset(False)
+        except Exception:
+            pass
+
+        # Ensure cancel text exists
+        try:
+            self.setCancelButtonText("Cancel")
+        except Exception:
+            pass
+
+        # Intercept Qt's cancel flow via signal (this is reliable in PySide6)
+        self.canceled.connect(self._on_canceled)
+
+    def confirmedCanceled(self) -> bool:
+        """Return True only if the user confirmed stopping."""
+        return self._confirmed_cancelled
+
+    def close_without_confirmation(self):
+        """
+        Close the dialog for normal teardown without treating it as a user cancel.
+        """
+        self._confirmation_disabled = True
+        blocker = None
+        try:
+            blocker = QtCore.QSignalBlocker(self)
+        except Exception:
+            blocker = None
+
+        try:
+            try:
+                self.reset()
+            except Exception:
+                pass
+
+            try:
+                self.close()
+            except Exception:
+                pass
+        finally:
+            del blocker
+
+    def _on_canceled(self):
+        """
+        Qt has already marked the dialog as canceled and may hide it.
+        We show confirmation ASAP (queued to the event loop) and then either:
+        - confirm: keep _confirmed_cancelled=True (batch loop will stop)
+        - decline: reset & re-show dialog, and keep _confirmed_cancelled=False (batch continues)
+        """
+        if self._confirmation_disabled:
+            return
+        if self._confirmed_cancelled:
+            return
+        if self._confirm_dialog_open:
+            return
+
+        # Defer confirmation to next event loop turn to avoid showing behind/after close
+        QtCore.QTimer.singleShot(0, self._show_confirm_and_apply)
+
+    def _show_confirm_and_apply(self):
+        if self._confirmation_disabled:
+            return
+        if self._confirmed_cancelled:
+            return
+        if self._confirm_dialog_open:
+            return
+
+        self._confirm_dialog_open = True
+        try:
+            parent = self.parent() or self
+
+            box = QtWidgets.QMessageBox(parent)
+            box.setIcon(QtWidgets.QMessageBox.Warning)
+            box.setWindowTitle("Confirm stop")
+            box.setText("Stop the current task?")
+            box.setInformativeText(
+                "Processing will stop immediately.\nOutputs may be incomplete."
+            )
+            box.setStandardButtons(QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
+            box.setDefaultButton(QtWidgets.QMessageBox.No)
+
+            # Force on-top to avoid “dialog appears only after main window closes”
+            try:
+                box.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
+            except Exception:
+                pass
+
+            ret = box.exec()
+
+            if ret == QtWidgets.QMessageBox.Yes:
+                self._confirmed_cancelled = True
+                # leave as-is; batch loop will see confirmedCanceled()==True and stop
+                return
+
+            # User declined: undo the cancel state and re-show progress dialog
+            self._confirmed_cancelled = False
+
+            # reset() clears internal canceled/hidden state; safe even if already hidden
+            try:
+                self.reset()
+            except Exception:
+                pass
+
+            try:
+                self.show()
+                self.raise_()
+                self.activateWindow()
+            except Exception:
+                pass
+
+        finally:
+            self._confirm_dialog_open = False
 
 
 class LoadLastWorkspaceDialog(QtWidgets.QDialog):
@@ -1441,7 +2155,7 @@ class JobLoadingDialog(QtWidgets.QDialog):
 
 
 class SaveJobDialog(QtWidgets.QDialog):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, input_filename=""):
         super().__init__(parent)
         self.setWindowTitle("Save Job")
         self.setWindowIcon(QtGui.QIcon(":/media/media/visomaster_small.png"))
@@ -1449,7 +2163,8 @@ class SaveJobDialog(QtWidgets.QDialog):
         # Widgets
         self.job_name_label = QtWidgets.QLabel("Job Name:")
         self.job_name_edit = QtWidgets.QLineEdit(self)
-        self.job_name_edit.setPlaceholderText("Enter job name")
+        # self.job_name_edit.setPlaceholderText("Enter job name")
+        self.job_name_edit.setText(input_filename)
 
         self.set_output_name_checkbox = QtWidgets.QCheckBox(
             "Use job name for output file name", self
@@ -1458,7 +2173,8 @@ class SaveJobDialog(QtWidgets.QDialog):
 
         self.output_name_label = QtWidgets.QLabel("Output File Name:")
         self.output_name_edit = QtWidgets.QLineEdit(self)
-        self.output_name_edit.setPlaceholderText("Leave blank for default")
+        # self.output_name_edit.setPlaceholderText("Leave blank for default")
+        self.output_name_edit.setText(input_filename)
 
         # Button box
         QBtn = QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
@@ -1544,15 +2260,61 @@ class SelectionBox(QtWidgets.QComboBox, ParametersWidget):
         if callable(self.selection_values) and callable(self.default_value):
             self.clear()
             self.addItems(self.selection_values())
-            self.setCurrentText(self.default_value())
+            self.set_value(self.default_value())
         else:
-            self.setCurrentText(self.default_value)
+            self.set_value(self.default_value)
 
     def set_value(self, value):
-        if callable(value):
-            self.setCurrentText(value())
+        resolved_value = value() if callable(value) else value
+        data_index = self.findData(resolved_value)
+        if data_index != -1:
+            self.setCurrentIndex(data_index)
         else:
-            self.setCurrentText(value)
+            self.setCurrentText(resolved_value)
+
+    def showPopup(self):
+        view = self.view()
+        if view and self.count() > 0:
+            view.setUniformItemSizes(True)
+            view.setVerticalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
+            row_height = max(view.sizeHintForRow(0), self.sizeHint().height())
+            frame = view.frameWidth() * 2
+            desired_height = (row_height * self.count()) + frame
+            popup_origin = self.mapToGlobal(QtCore.QPoint(0, 0))
+            app = QtWidgets.QApplication.instance()
+            screen = app.screenAt(popup_origin) if app else None
+            if screen is None:
+                screen = self.screen()
+            available = (
+                screen.availableGeometry() if screen else QtCore.QRect(0, 0, 800, 600)
+            )
+            space_below = available.bottom() - (popup_origin.y() + self.height()) - 8
+            space_above = popup_origin.y() - available.top() - 8
+            max_space = max(space_below, space_above, 0)
+
+            if desired_height <= max(space_below, 0):
+                popup_height = desired_height
+            elif desired_height <= max(space_above, 0):
+                popup_height = desired_height
+            else:
+                popup_height = max(min(desired_height, max_space), row_height + frame)
+
+            view.setMinimumHeight(popup_height)
+            view.setMaximumHeight(popup_height)
+        super().showPopup()
+
+    def wheelEvent(self, event: QtGui.QWheelEvent):
+        wheel_control_enabled = bool(
+            self.main_window.control.get("SliderMouseWheelControlToggle", False)
+        )
+        ctrl_pressed = bool(
+            QtWidgets.QApplication.keyboardModifiers()
+            & QtCore.Qt.KeyboardModifier.ControlModifier
+        )
+        if not wheel_control_enabled and not ctrl_pressed:
+            event.ignore()
+            return
+        super().wheelEvent(event)
 
 
 class ToggleButton(QtWidgets.QPushButton, ParametersWidget):
@@ -1595,6 +2357,31 @@ class ToggleButton(QtWidgets.QPushButton, ParametersWidget):
                 None,
             )
         )
+
+        # Check Denoiser Button
+        if self.widget_name and "Denoiser" in self.widget_name:
+            self.toggled.connect(self._trigger_kv_recalc)
+
+    def _trigger_kv_recalc(self, checked):
+        """
+        Forces the update of K/V Maps and refreshes the image.
+        Uses a QTimer to delay execution and ensure that
+        main_window.control has properly registered the 'True' state of the button.
+        """
+
+        def delayed_recalc():
+            # 1. Recalculate the K/V map for all target faces
+            if hasattr(self.main_window, "target_faces"):
+                for face in self.main_window.target_faces.values():
+                    face.calculate_assigned_input_embedding()
+
+            # 2. Force image refresh with the new data
+            import app.ui.widgets.actions.common_actions as common_widget_actions
+
+            common_widget_actions.refresh_frame(self.main_window)
+
+        # 50 ms delay for PySide6
+        QtCore.QTimer.singleShot(50, delayed_recalc)
 
     # Property for animation
     def _get_circle_position(self):
@@ -1722,6 +2509,17 @@ class ParameterSlider(QtWidgets.QSlider, ParametersWidget):
 
     def wheelEvent(self, event):
         """Override wheel event to define custom increments/decrements with the mouse wheel."""
+        wheel_control_enabled = bool(
+            self.main_window.control.get("SliderMouseWheelControlToggle", False)
+        )
+        ctrl_pressed = bool(
+            QtWidgets.QApplication.keyboardModifiers()
+            & QtCore.Qt.KeyboardModifier.ControlModifier
+        )
+        if not wheel_control_enabled and not ctrl_pressed:
+            event.ignore()
+            return
+
         num_steps = event.angleDelta().y() / 120  # 120 is one step of the wheel
 
         # Adjust the current value based on the number of steps
@@ -1767,9 +2565,7 @@ class ParameterSlider(QtWidgets.QSlider, ParametersWidget):
 
     def mousePressEvent(self, event):
         """Handle the mouse press event to update the slider value immediately."""
-        if (
-            event.button() == QtCore.Qt.LeftButton
-        ):  # Verifica che sia il pulsante sinistro del mouse
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
             self.setValue(self.pos_to_value(event.pos().x()))
 
         # Chiama il metodo della classe base per gestire il resto dell'evento
@@ -1882,6 +2678,17 @@ class ParameterDecimalSlider(QtWidgets.QSlider, ParametersWidget):
 
     def wheelEvent(self, event):
         """Override wheel event to define custom increments/decrements with the mouse wheel."""
+        wheel_control_enabled = bool(
+            self.main_window.control.get("SliderMouseWheelControlToggle", False)
+        )
+        ctrl_pressed = bool(
+            QtWidgets.QApplication.keyboardModifiers()
+            & QtCore.Qt.KeyboardModifier.ControlModifier
+        )
+        if not wheel_control_enabled and not ctrl_pressed:
+            event.ignore()
+            return
+
         num_steps = event.angleDelta().y() / 120  # 120 is one step of the wheel
 
         # Adjust the current value based on the number of steps
@@ -1933,10 +2740,7 @@ class ParameterDecimalSlider(QtWidgets.QSlider, ParametersWidget):
 
     def mousePressEvent(self, event):
         """Handle the mouse press event to update the slider value immediately."""
-        if (
-            event.button() == QtCore.Qt.LeftButton
-        ):  # Verifica che sia il pulsante sinistro del mouse
-            # Aggiorna immediatamente il valore dello slider
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
             self.setValue(self.pos_to_value(event.pos().x()))
 
         # Chiama il metodo della classe base per gestire il resto dell'evento
@@ -2161,3 +2965,203 @@ class FormGroupBox(QtWidgets.QGroupBox):
             QtWidgets.QSizePolicy.Minimum, QtWidgets.QSizePolicy.Preferred
         )
         self.setFlat(True)
+
+
+class SectionHeaderButton(QtWidgets.QPushButton):
+    def __init__(self, title: str, expanded: bool = True, parent=None):
+        super().__init__(title, parent)
+        self._indicator_angle: float = 90.0 if expanded else 0.0
+        self._fixed_height = 24
+        self.setCursor(QtCore.Qt.PointingHandCursor)
+        self.setFlat(True)
+        self.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
+        self.setFixedHeight(self._fixed_height)
+        self.setText("")
+        self.setStyleSheet("QPushButton {border: none;background: transparent;}")
+        self._title = title
+
+    def _get_indicator_angle(self) -> float:
+        return self._indicator_angle
+
+    def _set_indicator_angle(self, angle: float):
+        self._indicator_angle = angle
+        self.update()
+
+    indicator_angle = QtCore.Property(
+        float,
+        fget=_get_indicator_angle,
+        fset=_set_indicator_angle,
+    )
+
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+
+        background_rect = self.rect().adjusted(0, 0, -1, -1)
+        background_color = self.palette().buttonText().color()
+        background_color.setAlpha(20 if self.underMouse() else 10)
+        painter.setPen(QtCore.Qt.PenStyle.NoPen)
+        painter.setBrush(background_color)
+        painter.drawRoundedRect(background_rect, 4, 4)
+
+        painter.setPen(QtCore.Qt.PenStyle.NoPen)
+        painter.setBrush(self.palette().buttonText())
+
+        triangle = QtGui.QPolygonF(
+            [
+                QtCore.QPointF(-3.5, -4.5),
+                QtCore.QPointF(-3.5, 4.5),
+                QtCore.QPointF(4.5, 0),
+            ]
+        )
+        center = QtCore.QPointF(11, self.height() / 2)
+        painter.translate(center)
+        painter.rotate(self._indicator_angle)
+        painter.drawPolygon(triangle)
+        painter.resetTransform()
+
+        text_rect = self.rect().adjusted(24, 0, -8, 0)
+        painter.setPen(self.palette().buttonText().color())
+        font = painter.font()
+        font.setWeight(QtGui.QFont.Weight.Bold)
+        painter.setFont(font)
+        painter.drawText(
+            text_rect,
+            QtCore.Qt.AlignmentFlag.AlignVCenter | QtCore.Qt.AlignmentFlag.AlignLeft,
+            self._title,
+        )
+        painter.end()
+
+
+class CollapsibleSection(QtWidgets.QWidget):
+    _expanded_layout_spacing = 2
+    _collapsed_layout_spacing = 0
+    _expanded_bottom_margin = 2
+    _collapsed_bottom_margin = 2
+
+    def __init__(
+        self,
+        main_window: "MainWindow",
+        title: str,
+        section_id: str,
+        expanded: bool = True,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.main_window = main_window
+        self.section_id = section_id
+        self._expanded = expanded
+
+        self.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Maximum,
+        )
+
+        self.header_button = SectionHeaderButton(title, expanded=expanded, parent=self)
+        self.header_button.clicked.connect(
+            lambda _checked=False: self.toggle_expanded()
+        )
+
+        self.content_widget = QtWidgets.QWidget(self)
+        self.content_widget.setVisible(expanded)
+        self.content_widget.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Maximum,
+        )
+
+        self.indicator_animation = QtCore.QPropertyAnimation(
+            self.header_button, b"indicator_angle", self
+        )
+        self.indicator_animation.setDuration(160)
+        self.indicator_animation.setEasingCurve(QtCore.QEasingCurve.Type.OutCubic)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, self._expanded_bottom_margin)
+        layout.setSpacing(self._expanded_layout_spacing)
+        layout.addWidget(self.header_button)
+        layout.addWidget(self.content_widget)
+        self._apply_layout_mode(expanded)
+
+    def content_layout(self) -> QtWidgets.QVBoxLayout:
+        existing_layout = self.content_widget.layout()
+        if existing_layout is None:
+            content_layout = QtWidgets.QVBoxLayout(self.content_widget)
+            content_layout.setContentsMargins(0, 0, 0, 0)
+            content_layout.setSpacing(0)
+            return content_layout
+        return existing_layout
+
+    def is_expanded(self) -> bool:
+        return self._expanded
+
+    def _collapsed_height(self) -> int:
+        margins = self.layout().contentsMargins()
+        return margins.top() + self.header_button.height() + margins.bottom()
+
+    def _collapsed_size(self) -> QtCore.QSize:
+        return QtCore.QSize(0, self._collapsed_height())
+
+    def _apply_layout_mode(self, expanded: bool) -> None:
+        layout = self.layout()
+        if expanded:
+            layout.setContentsMargins(0, 0, 0, self._expanded_bottom_margin)
+            layout.setSpacing(self._expanded_layout_spacing)
+            self.content_widget.setVisible(True)
+            self.content_widget.setMinimumHeight(0)
+            self.content_widget.setMaximumHeight(16777215)
+        else:
+            layout.setContentsMargins(0, 0, 0, self._collapsed_bottom_margin)
+            layout.setSpacing(self._collapsed_layout_spacing)
+            self.content_widget.setVisible(False)
+            self.content_widget.setMinimumHeight(0)
+            self.content_widget.setMaximumHeight(0)
+        self.content_widget.updateGeometry()
+        layout.invalidate()
+        layout.activate()
+
+    def minimumSizeHint(self) -> QtCore.QSize:
+        if not self._expanded:
+            return self._collapsed_size()
+        return super().minimumSizeHint()
+
+    def sizeHint(self) -> QtCore.QSize:
+        if not self._expanded:
+            return self._collapsed_size()
+        return super().sizeHint()
+
+    def set_expanded(
+        self,
+        expanded: bool,
+        animate: bool = True,
+        update_state: bool = True,
+    ):
+        expanded = bool(expanded)
+        previous_state = self._expanded
+        self._expanded = expanded
+
+        self._apply_layout_mode(expanded)
+        self.adjustSize()
+        self.updateGeometry()
+        parent_layout = self.parentWidget().layout() if self.parentWidget() else None
+        if parent_layout is not None:
+            parent_layout.invalidate()
+            parent_layout.activate()
+
+        start_angle = 90 if previous_state else 0
+        end_angle = 90 if expanded else 0
+        if animate:
+            self.indicator_animation.stop()
+            self.indicator_animation.setStartValue(start_angle)
+            self.indicator_animation.setEndValue(end_angle)
+            self.indicator_animation.start()
+        else:
+            self.header_button.indicator_angle = end_angle
+
+        if update_state:
+            self.main_window.parameter_section_states[self.section_id] = expanded
+
+    def toggle_expanded(self):
+        self.set_expanded(not self._expanded)

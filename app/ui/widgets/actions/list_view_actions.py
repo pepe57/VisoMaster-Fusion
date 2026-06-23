@@ -1,12 +1,14 @@
-import time
+from collections import deque
 from functools import partial
 from typing import TYPE_CHECKING, Dict, Type
-import subprocess
+from pathlib import Path
 import sys
 import os
+import subprocess
 
 from PySide6 import QtWidgets, QtGui, QtCore
 
+from app.helpers.app_metadata import AppDisplayMetadata, get_app_display_metadata
 from app.ui.widgets.actions import common_actions as common_widget_actions
 from app.ui.widgets.actions import card_actions
 from app.ui.widgets.actions import filter_actions
@@ -17,30 +19,188 @@ from app.ui.widgets import ui_workers
 if TYPE_CHECKING:
     from app.ui.main_ui import MainWindow
 
+_WORKER_STOP_TIMEOUT_MS = 1000
+_TARGET_BUTTON_SIZE = (96, 96)
+_SMALL_FACE_BUTTON_SIZE = (70, 70)
+_LARGE_FACE_BUTTON_SIZE = (96, 96)
+_FACE_BUTTON_SIZE = _SMALL_FACE_BUTTON_SIZE
+_EMBED_BUTTON_SIZE = (120, 25)
+_EMBED_LIST_HEIGHT = 140
+_TARGET_MEDIA_BATCH_SIZE = 24
+_TARGET_MEDIA_BATCH_INTERVAL_MS = 1
+
+
+def _get_target_media_batch_size(pending_count: int) -> int:
+    # Adaptive batch sizing: small queue keeps UI very responsive, large queue
+    # increases throughput to reduce total drain time.
+    if pending_count >= 1500:
+        return 64
+    if pending_count >= 900:
+        return 48
+    if pending_count >= 400:
+        return 36
+    return _TARGET_MEDIA_BATCH_SIZE
+
+
+def _ensure_target_media_batch_timer(main_window: "MainWindow") -> QtCore.QTimer:
+    timer = getattr(main_window, "_target_media_batch_timer", None)
+    if timer is None:
+        timer = QtCore.QTimer(main_window)
+        timer.setSingleShot(True)
+        timer.timeout.connect(partial(_flush_target_media_thumbnail_batch, main_window))
+        main_window._target_media_batch_timer = timer
+    return timer
+
+
+def _flush_target_media_thumbnail_batch(main_window: "MainWindow") -> None:
+    pending_items = getattr(main_window, "_pending_target_media_thumbnails", None)
+    if not pending_items:
+        return
+
+    list_widget = main_window.targetVideosList
+    pending_before = len(pending_items)
+    list_widget.setUpdatesEnabled(False)
+    try:
+        adaptive_batch_size = _get_target_media_batch_size(pending_before)
+        batch_size = min(adaptive_batch_size, pending_before)
+        for _ in range(batch_size):
+            media_path, q_image, file_type, media_id = pending_items.popleft()
+            add_media_thumbnail_button(
+                main_window,
+                widget_components.TargetMediaCardButton,
+                list_widget,
+                main_window.target_videos,
+                q_image,
+                media_path=media_path,
+                file_type=file_type,
+                media_id=media_id,
+            )
+    finally:
+        list_widget.setUpdatesEnabled(True)
+        list_widget.viewport().update()
+
+    if pending_items:
+        _ensure_target_media_batch_timer(main_window).start(
+            _TARGET_MEDIA_BATCH_INTERVAL_MS
+        )
+
+
+def _queue_target_media_thumbnail(
+    main_window: "MainWindow", media_path, q_image, file_type, media_id
+) -> None:
+    pending_items = getattr(main_window, "_pending_target_media_thumbnails", None)
+    if pending_items is None:
+        pending_items = deque()
+        main_window._pending_target_media_thumbnails = pending_items
+
+    pending_items.append((media_path, q_image, file_type, media_id))
+    timer = _ensure_target_media_batch_timer(main_window)
+    if not timer.isActive():
+        timer.start(_TARGET_MEDIA_BATCH_INTERVAL_MS)
+
+
+def _has_pending_target_media_thumbnail_work(main_window: "MainWindow") -> bool:
+    timer = getattr(main_window, "_target_media_batch_timer", None)
+    pending_items = getattr(main_window, "_pending_target_media_thumbnails", None)
+    return bool(pending_items) or bool(timer and timer.isActive())
+
+
+# INPUT FACES BATCHING SYSTEM
+def _ensure_input_face_batch_timer(main_window: "MainWindow") -> QtCore.QTimer:
+    """
+    Ensures a QTimer exists for batching input face thumbnails.
+    This timer regulates the flow of UI updates to prevent freezing.
+    """
+    timer = getattr(main_window, "_input_face_batch_timer", None)
+    if timer is None:
+        timer = QtCore.QTimer(main_window)
+        timer.setSingleShot(True)
+        timer.timeout.connect(partial(_flush_input_face_thumbnail_batch, main_window))
+        main_window._input_face_batch_timer = timer
+    return timer
+
+
+def _flush_input_face_thumbnail_batch(main_window: "MainWindow") -> None:
+    """
+    Processes a batch of pending input face thumbnails.
+    Disables UI updates during processing to eliminate flickering and reduce main thread load.
+    """
+    pending_items = getattr(main_window, "_pending_input_face_thumbnails", None)
+    if not pending_items:
+        return
+
+    list_widget = main_window.inputFacesList
+    pending_before = len(pending_items)
+
+    # Block rendering to prevent UI flickering (Critical for performance)
+    list_widget.setUpdatesEnabled(False)
+    try:
+        # Conservative batch size (24) to avoid saturating the main thread
+        # with heavy PyTorch Tensors and K/V dictionary injections.
+        batch_size = min(24, pending_before)
+        for _ in range(batch_size):
+            media_path, cropped_face, embedding_store, q_image, face_id = (
+                pending_items.popleft()
+            )
+            add_media_thumbnail_button(
+                main_window,
+                widget_components.InputFaceCardButton,
+                list_widget,
+                main_window.input_faces,
+                q_image,
+                media_path=media_path,
+                cropped_face=cropped_face,
+                embedding_store=embedding_store,
+                face_id=face_id,
+            )
+    finally:
+        # Re-enable and force a single paint event
+        list_widget.setUpdatesEnabled(True)
+        list_widget.viewport().update()
+
+    # If items remain in the queue, restart the timer for the next batch
+    if pending_items:
+        _ensure_input_face_batch_timer(main_window).start(
+            _TARGET_MEDIA_BATCH_INTERVAL_MS
+        )
+
+
+def _queue_input_face_thumbnail(
+    main_window: "MainWindow",
+    media_path,
+    cropped_face,
+    embedding_store,
+    q_image,
+    face_id,
+) -> None:
+    """
+    Appends a loaded input face to the queue and starts the batching timer if not already running.
+    """
+    pending_items = getattr(main_window, "_pending_input_face_thumbnails", None)
+    if pending_items is None:
+        pending_items = deque()
+        main_window._pending_input_face_thumbnails = pending_items
+
+    pending_items.append((media_path, cropped_face, embedding_store, q_image, face_id))
+    timer = _ensure_input_face_batch_timer(main_window)
+    if not timer.isActive():
+        timer.start(_TARGET_MEDIA_BATCH_INTERVAL_MS)
+
 
 # Functions to add Buttons with thumbnail for selecting videos/images and faces
-@QtCore.Slot(str, QtGui.QPixmap)
+@QtCore.Slot(str, QtGui.QImage, str, str)
 def add_media_thumbnail_to_target_videos_list(
-    main_window: "MainWindow", media_path, pixmap, file_type, media_id
+    main_window: "MainWindow", media_path, q_image, file_type, media_id
 ):
-    add_media_thumbnail_button(
-        main_window,
-        widget_components.TargetMediaCardButton,
-        main_window.targetVideosList,
-        main_window.target_videos,
-        pixmap,
-        media_path=media_path,
-        file_type=file_type,
-        media_id=media_id,
-    )
+    _queue_target_media_thumbnail(main_window, media_path, q_image, file_type, media_id)
 
 
 # Functions to add Buttons with thumbnail for selecting videos/images and faces
-@QtCore.Slot(str, QtGui.QPixmap, str, int, int)
+@QtCore.Slot(str, QtGui.QImage, str, str, int, int)
 def add_webcam_thumbnail_to_target_videos_list(
     main_window: "MainWindow",
     media_path,
-    pixmap,
+    q_image,
     file_type,
     media_id,
     webcam_index,
@@ -51,7 +211,7 @@ def add_webcam_thumbnail_to_target_videos_list(
         widget_components.TargetMediaCardButton,
         main_window.targetVideosList,
         main_window.target_videos,
-        pixmap,
+        q_image,
         media_path=media_path,
         file_type=file_type,
         media_id=media_id,
@@ -63,39 +223,33 @@ def add_webcam_thumbnail_to_target_videos_list(
 
 @QtCore.Slot()
 def add_media_thumbnail_to_target_faces_list(
-    main_window: "MainWindow", cropped_face, embedding_store, pixmap, face_id
+    main_window: "MainWindow", cropped_face, embedding_store, image_data, face_id
 ):
     add_media_thumbnail_button(
         main_window,
         widget_components.TargetFaceCardButton,
         main_window.targetFacesList,
         main_window.target_faces,
-        pixmap,
+        image_data,
         cropped_face=cropped_face,
         embedding_store=embedding_store,
         face_id=face_id,
     )
 
 
-@QtCore.Slot()
+@QtCore.Slot(str, object, object, QtGui.QImage, str)
 def add_media_thumbnail_to_source_faces_list(
     main_window: "MainWindow",
     media_path,
     cropped_face,
     embedding_store,
-    pixmap,
+    q_image,
     face_id,
 ):
-    add_media_thumbnail_button(
-        main_window,
-        widget_components.InputFaceCardButton,
-        main_window.inputFacesList,
-        main_window.input_faces,
-        pixmap,
-        media_path=media_path,
-        cropped_face=cropped_face,
-        embedding_store=embedding_store,
-        face_id=face_id,
+    # Route the incoming data to the queue instead of instantiating the UI widget immediately.
+    # This delegates the heavy lifting to the batching system, preventing UI freezing and flickering.
+    _queue_input_face_thumbnail(
+        main_window, media_path, cropped_face, embedding_store, q_image, face_id
     )
 
 
@@ -104,7 +258,7 @@ def add_media_thumbnail_button(
     buttonClass: "Type[widget_components.CardButton]",
     listWidget: QtWidgets.QListWidget,
     buttons_list: Dict,
-    pixmap,
+    image_data,  # Accepts QImage (from workers) or QPixmap (from main thread)
     **kwargs,
 ):
     if buttonClass == widget_components.TargetMediaCardButton:
@@ -131,20 +285,33 @@ def add_media_thumbnail_button(
             kwargs.get("embedding_store"),
             kwargs.get("face_id"),
         ]
+
     if buttonClass == widget_components.TargetMediaCardButton:
-        button_size = QtCore.QSize(90, 90)  # Set a fixed size for the buttons
+        button_size = QtCore.QSize(*_TARGET_BUTTON_SIZE)
     else:
-        button_size = QtCore.QSize(70, 70)  # Set a fixed size for the buttons
+        button_size = QtCore.QSize(*_get_face_button_size(main_window))
 
     button: widget_components.CardButton = buttonClass(
         *constructor_args, main_window=main_window
     )
-    button.setIcon(QtGui.QIcon(pixmap))
-    button.setIconSize(
-        button_size - QtCore.QSize(8, 8)
-    )  # Slightly smaller than the button size to add some margin
+
+    # --- Main thread conversion ---
+    if isinstance(image_data, QtGui.QImage):
+        pixmap = QtGui.QPixmap.fromImage(image_data)
+    else:
+        pixmap = image_data
+
     button.setFixedSize(button_size)
     button.setCheckable(True)
+
+    if buttonClass == widget_components.TargetMediaCardButton:
+        button.set_thumbnail_pixmap(pixmap)
+    else:
+        button.setIcon(QtGui.QIcon(pixmap))
+        button.setIconSize(
+            button_size - QtCore.QSize(8, 8)
+        )  # Slightly smaller than the button size to add some margin
+
     if buttonClass in [
         widget_components.TargetFaceCardButton,
         widget_components.InputFaceCardButton,
@@ -154,6 +321,7 @@ def add_media_thumbnail_button(
         buttons_list[button.media_id] = button
     elif buttonClass == widget_components.EmbeddingCardButton:
         buttons_list[button.embedding_id] = button
+
     # Create a QListWidgetItem and set the button as its widget
     list_item = QtWidgets.QListWidgetItem(listWidget)
     list_item.setSizeHint(button_size)
@@ -162,44 +330,90 @@ def add_media_thumbnail_button(
     # Align the item to center
     list_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
     listWidget.setItemWidget(list_item, button)
-    # Adjust the QListWidget properties to handle the grid layout
-    grid_size_with_padding = button_size + QtCore.QSize(
-        4, 4
-    )  # Add padding around the buttons
-    listWidget.setGridSize(grid_size_with_padding)  # Set grid size with padding
-    listWidget.setWrapping(True)  # Enable wrapping to have items in rows
-    listWidget.setFlow(QtWidgets.QListView.LeftToRight)  # Set flow direction
-    listWidget.setResizeMode(QtWidgets.QListView.Adjust)  # Adjust layout automatically
+
+    if buttonClass == widget_components.TargetFaceCardButton:
+        refresh_target_face_display_labels(main_window)
 
 
-def create_and_add_embed_button_to_list(
-    main_window: "MainWindow", embedding_name, embedding_store, embedding_id
-):
-    inputEmbeddingsList = main_window.inputEmbeddingsList
-    # Passa l'intero embedding_store
-    embed_button = widget_components.EmbeddingCardButton(
-        main_window=main_window,
-        embedding_name=embedding_name,
-        embedding_store=embedding_store,
-        embedding_id=embedding_id,
+def refresh_target_face_display_labels(main_window: "MainWindow"):
+    target_faces_list = getattr(main_window, "targetFacesList", None)
+    if target_faces_list is None:
+        return
+
+    for i in range(target_faces_list.count()):
+        list_item = target_faces_list.item(i)
+        target_face_button = target_faces_list.itemWidget(list_item)
+        if isinstance(target_face_button, widget_components.TargetFaceCardButton):
+            target_face_button.refresh_display_label()
+
+
+def _get_face_button_size(main_window: "MainWindow") -> tuple[int, int]:
+    return getattr(main_window, "face_thumbnail_button_size", _FACE_BUTTON_SIZE)
+
+
+def apply_face_thumbnail_size(
+    main_window: "MainWindow", button_size_tuple: tuple[int, int]
+) -> None:
+    main_window.face_thumbnail_button_size = button_size_tuple
+    button_size = QtCore.QSize(*button_size_tuple)
+    grid_size_with_padding = button_size + QtCore.QSize(4, 4)
+
+    for listWidget in (main_window.targetFacesList, main_window.inputFacesList):
+        listWidget.setGridSize(grid_size_with_padding)
+        for i in range(listWidget.count()):
+            list_item = listWidget.item(i)
+            button = listWidget.itemWidget(list_item)
+            if button is None:
+                continue
+            button.setFixedSize(button_size)
+            button.setIconSize(
+                button_size - QtCore.QSize(8, 8)
+            )  # Slightly smaller than the button size to add some margin
+            list_item.setSizeHint(button_size)
+        listWidget.doItemsLayout()
+        listWidget.viewport().update()
+
+
+def initialize_media_list_widgets(main_window: "MainWindow"):
+    """One-time configuration for target/input media and face list widgets."""
+    if not hasattr(main_window, "face_thumbnail_button_size"):
+        main_window.face_thumbnail_button_size = _FACE_BUTTON_SIZE
+
+    for listWidget, button_size_tuple in [
+        (main_window.targetVideosList, _TARGET_BUTTON_SIZE),
+        (main_window.targetFacesList, _get_face_button_size(main_window)),
+        (main_window.inputFacesList, _get_face_button_size(main_window)),
+    ]:
+        button_size = QtCore.QSize(*button_size_tuple)
+        grid_size_with_padding = button_size + QtCore.QSize(4, 4)
+        listWidget.setGridSize(grid_size_with_padding)
+        listWidget.setWrapping(True)
+        listWidget.setFlow(QtWidgets.QListView.LeftToRight)
+        listWidget.setViewMode(QtWidgets.QListView.IconMode)
+        listWidget.setMovement(QtWidgets.QListView.Static)
+        listWidget.setResizeMode(QtWidgets.QListView.Adjust)
+        listWidget.setUniformItemSizes(True)
+        # MODIFIED: Both target and input media now use explicit Python queue batchers.
+        if listWidget in (main_window.targetVideosList, main_window.inputFacesList):
+            listWidget.setLayoutMode(QtWidgets.QListView.SinglePass)
+        else:
+            listWidget.setLayoutMode(QtWidgets.QListView.Batched)
+            listWidget.setBatchSize(_TARGET_MEDIA_BATCH_SIZE)
+        listWidget.setVerticalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
+        listWidget.setHorizontalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
+
+    _set_up_panel_context_menu(
+        main_window, main_window.targetVideosList, "target_media"
     )
+    _set_up_panel_context_menu(main_window, main_window.inputFacesList, "input_faces")
 
-    button_size = QtCore.QSize(
-        120, 25
-    )  # Adjusted width to fit 3 per row with proper spacing
-    embed_button.setFixedSize(button_size)
 
-    list_item = QtWidgets.QListWidgetItem(inputEmbeddingsList)
-    list_item.setSizeHint(button_size)
-    embed_button.list_item = list_item
-    list_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+def initialize_embeddings_list_widget(main_window: "MainWindow"):
+    """One-time configuration for the inputEmbeddingsList widget."""
+    inputEmbeddingsList = main_window.inputEmbeddingsList
+    button_size = QtCore.QSize(*_EMBED_BUTTON_SIZE)
+    grid_size_with_padding = button_size + QtCore.QSize(4, 4)
 
-    inputEmbeddingsList.setItemWidget(list_item, embed_button)
-
-    # Configure grid layout for 3x3 minimum grid
-    grid_size_with_padding = button_size + QtCore.QSize(
-        4, 4
-    )  # Add padding around buttons
     inputEmbeddingsList.setGridSize(grid_size_with_padding)
     inputEmbeddingsList.setWrapping(True)
     inputEmbeddingsList.setFlow(QtWidgets.QListView.TopToBottom)
@@ -209,20 +423,12 @@ def create_and_add_embed_button_to_list(
     inputEmbeddingsList.setViewMode(QtWidgets.QListView.IconMode)
     inputEmbeddingsList.setMovement(QtWidgets.QListView.Static)
 
-    # Set viewport mode and item size
-    viewport_height = 140  # Fixed height for 3 rows (35px + padding per row)
-    inputEmbeddingsList.setFixedHeight(viewport_height)
+    inputEmbeddingsList.setFixedHeight(_EMBED_LIST_HEIGHT)
 
-    # Calculate grid dimensions
     col_width = grid_size_with_padding.width()
-
-    # Set minimum width for 3 columns and adjust spacing
-    min_width = (
-        3 * col_width
-    ) + 16  # Add extra padding for better spacing between columns
+    min_width = (3 * col_width) + 16
     inputEmbeddingsList.setMinimumWidth(min_width)
 
-    # Configure scrolling behavior
     inputEmbeddingsList.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
     inputEmbeddingsList.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
     inputEmbeddingsList.setVerticalScrollMode(
@@ -232,28 +438,65 @@ def create_and_add_embed_button_to_list(
         QtWidgets.QAbstractItemView.ScrollPerPixel
     )
 
-    # Set layout direction to ensure proper filling
     inputEmbeddingsList.setLayoutDirection(QtCore.Qt.LeftToRight)
     inputEmbeddingsList.setLayoutMode(QtWidgets.QListView.Batched)
+    _set_up_panel_context_menu(main_window, inputEmbeddingsList, "embeddings")
+
+
+def create_and_add_embed_button_to_list(
+    main_window: "MainWindow", embedding_name, embedding_store, embedding_id
+):
+    inputEmbeddingsList = main_window.inputEmbeddingsList
+    embed_button = widget_components.EmbeddingCardButton(
+        main_window=main_window,
+        embedding_name=embedding_name,
+        embedding_store=embedding_store,
+        embedding_id=embedding_id,
+    )
+
+    button_size = QtCore.QSize(*_EMBED_BUTTON_SIZE)
+    embed_button.setFixedSize(button_size)
+
+    list_item = QtWidgets.QListWidgetItem(inputEmbeddingsList)
+    list_item.setSizeHint(button_size)
+    embed_button.list_item = list_item
+    list_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+
+    inputEmbeddingsList.setItemWidget(list_item, embed_button)
 
     main_window.merged_embeddings[embed_button.embedding_id] = embed_button
 
 
-def clear_stop_loading_target_media(main_window: "MainWindow"):
-    if main_window.video_loader_worker and not isinstance(
-        main_window.video_loader_worker, bool
-    ):
-        main_window.video_loader_worker.stop()
-        main_window.video_loader_worker.terminate()
-        main_window.video_loader_worker = False
-        time.sleep(0.5)
-        main_window.targetVideosList.clear()
+def clear_stop_loading_target_media(main_window: "MainWindow", clear_list: bool = True):
+    batch_timer = getattr(main_window, "_target_media_batch_timer", None)
+    if batch_timer is not None:
+        batch_timer.stop()
+    main_window._pending_target_media_thumbnails = deque()
+
+    if main_window.video_loader_worker is not None:
+        worker = main_window.video_loader_worker
+        worker.blockSignals(True)
+        worker._running = False
+        worker.quit()
+        if not worker.wait(_WORKER_STOP_TIMEOUT_MS):
+            worker.terminate()
+            worker.wait()
+        main_window.video_loader_worker = None
+        if clear_list:
+            main_window.targetVideosList.clear()
 
 
 @QtCore.Slot()
 def select_target_medias(
     main_window: "MainWindow", source_type="folder", folder_name=False, files_list=None
 ):
+    from app.ui.widgets.actions import video_control_actions
+
+    if video_control_actions.block_if_issue_scan_active(
+        main_window, "change target media"
+    ):
+        return
+
     files_list = files_list or []
     if source_type == "folder":
         folder_name = QtWidgets.QFileDialog.getExistingDirectory(
@@ -261,10 +504,8 @@ def select_target_medias(
         )
         if not folder_name:
             return
-        main_window.labelTargetVideosPath.setText(
-            misc_helpers.truncate_text(folder_name)
-        )
-        main_window.labelTargetVideosPath.setToolTip(folder_name)
+        main_window.targetVideosPathLineEdit.setText(folder_name)
+        main_window.targetVideosPathLineEdit.setToolTip(folder_name)
         main_window.last_target_media_folder_path = folder_name
 
     elif source_type == "files":
@@ -273,10 +514,8 @@ def select_target_medias(
             return
         # Get Folder name from the first file
         file_dir = misc_helpers.get_dir_of_file(files_list[0])
-        main_window.labelTargetVideosPath.setText(
-            file_dir
-        )  # Just a temp text until i think of something better
-        main_window.labelTargetVideosPath.setToolTip(file_dir)
+        main_window.targetVideosPathLineEdit.setText(file_dir)
+        main_window.targetVideosPathLineEdit.setToolTip(file_dir)
         main_window.last_target_media_folder_path = file_dir
 
     clear_stop_loading_target_media(main_window)
@@ -299,15 +538,32 @@ def select_target_medias(
 
 @QtCore.Slot()
 def filter_target_videos(main_window):
+    from app.ui.widgets.actions import video_control_actions
+
+    if _has_pending_target_media_thumbnail_work(main_window):
+        QtCore.QTimer.singleShot(0, partial(filter_target_videos, main_window))
+        return
+
+    if video_control_actions.is_issue_scan_active(main_window):
+        video_control_actions._mark_pending_target_media_refresh(main_window)
+        return
     filter_actions.filter_target_videos(main_window)
     load_target_webcams(main_window)
 
 
 @QtCore.Slot()
-def load_target_webcams(
-    main_window: "MainWindow",
-):
-    if main_window.filterWebcamsCheckBox.isChecked():
+def load_target_webcams(main_window: "MainWindow", *args, **kwargs):
+    from app.ui.widgets.actions import video_control_actions
+
+    if video_control_actions.is_issue_scan_active(main_window):
+        video_control_actions._mark_pending_target_media_refresh(main_window)
+        return
+    if filter_actions._get_target_video_filter_checked(
+        main_window,
+        "targetVideosFilterWebcamsAction",
+        "targetVideosFilterWebcamsCheckBox",
+        False,
+    ):
         main_window.video_loader_worker = ui_workers.TargetMediaLoaderWorker(
             main_window=main_window, webcam_mode=True
         )
@@ -328,21 +584,193 @@ def load_target_webcams(
         main_window.placeholder_update_signal.emit(main_window.targetVideosList, False)
 
 
-def clear_stop_loading_input_media(main_window: "MainWindow"):
-    if main_window.input_faces_loader_worker and not isinstance(
-        main_window.input_faces_loader_worker, bool
+def clear_stop_loading_input_media(main_window: "MainWindow", clear_list: bool = True):
+    # ADDED: Safely stop the batching timer and clear the queue.
+    batch_timer = getattr(main_window, "_input_face_batch_timer", None)
+    if batch_timer is not None:
+        batch_timer.stop()
+    main_window._pending_input_face_thumbnails = deque()
+    if main_window.input_faces_loader_worker is not None:
+        worker = main_window.input_faces_loader_worker
+        worker.blockSignals(True)
+        worker._running = False
+        worker.quit()
+        if not worker.wait(_WORKER_STOP_TIMEOUT_MS):
+            worker.terminate()
+            worker.wait()
+        main_window.input_faces_loader_worker = None
+        if clear_list:
+            main_window.inputFacesList.clear()
+
+
+def _set_path_line_edit_value(line_edit: QtWidgets.QLineEdit, path: str) -> None:
+    line_edit.setText(path)
+    line_edit.setToolTip(path)
+
+
+def _confirm_panel_clear(main_window: "MainWindow", title: str, message: str) -> bool:
+    reply = QtWidgets.QMessageBox.question(
+        main_window,
+        title,
+        message,
+        QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+        QtWidgets.QMessageBox.No,
+    )
+    return reply == QtWidgets.QMessageBox.Yes
+
+
+def clear_all_target_media(main_window: "MainWindow") -> bool:
+    from app.ui.widgets.actions import video_control_actions
+
+    if video_control_actions.block_if_issue_scan_active(main_window, "clear all media"):
+        return False
+
+    if not main_window.target_videos:
+        return False
+
+    confirmed = _confirm_panel_clear(
+        main_window,
+        "Clear All Media",
+        "This will remove all target media, including webcams, and reset the "
+        "Target Media panel.\n\nFiles on disk will not be deleted.",
+    )
+    if not confirmed:
+        return False
+
+    clear_stop_loading_target_media(main_window, clear_list=False)
+
+    for target_media_button in list(main_window.target_videos.values()):
+        target_media_button.remove_target_media_from_list()
+
+    if main_window.target_faces:
+        card_actions.clear_target_faces(main_window, refresh_frame=False)
+
+    main_window.target_videos.clear()
+    main_window.selected_video_button = None
+    _set_path_line_edit_value(main_window.targetVideosPathLineEdit, "")
+    main_window.last_target_media_folder_path = ""
+    main_window.placeholder_update_signal.emit(main_window.targetVideosList, False)
+    return True
+
+
+def clear_all_input_faces(main_window: "MainWindow") -> bool:
+    from app.ui.widgets.actions import video_control_actions
+
+    if video_control_actions.block_if_issue_scan_active(main_window, "clear all faces"):
+        return False
+
+    if not main_window.input_faces:
+        return False
+
+    confirmed = _confirm_panel_clear(
+        main_window,
+        "Clear All Faces",
+        "This will remove all input faces and reset the Input Faces panel.\n\n"
+        "Files on disk will not be deleted.",
+    )
+    if not confirmed:
+        return False
+
+    clear_stop_loading_input_media(main_window, clear_list=False)
+
+    for input_face_button in list(main_window.input_faces.values()):
+        input_face_button.remove_kv_data_file()
+        input_face_button._remove_face_from_lists()
+        input_face_button.deleteLater()
+
+    common_widget_actions.refresh_frame(main_window)
+    _set_path_line_edit_value(main_window.inputFacesPathLineEdit, "")
+    main_window.last_input_media_folder_path = ""
+    main_window.placeholder_update_signal.emit(main_window.inputFacesList, False)
+    return True
+
+
+def clear_all_embeddings(main_window: "MainWindow") -> bool:
+    from app.ui.widgets.actions import video_control_actions
+
+    if video_control_actions.block_if_issue_scan_active(
+        main_window, "clear all embeddings"
     ):
-        main_window.input_faces_loader_worker.stop()
-        main_window.input_faces_loader_worker.terminate()
-        main_window.input_faces_loader_worker = False
-        time.sleep(0.5)
-        main_window.inputFacesList.clear()
+        return False
+
+    if not main_window.merged_embeddings:
+        return False
+
+    confirmed = _confirm_panel_clear(
+        main_window,
+        "Clear All Embeddings",
+        "This will remove all embeddings and reset the Embeddings panel.\n\n"
+        "Files on disk will not be deleted.",
+    )
+    if not confirmed:
+        return False
+
+    card_actions.clear_merged_embeddings(main_window)
+    return True
+
+
+def _build_panel_context_menu(
+    main_window: "MainWindow",
+    list_widget: QtWidgets.QListWidget,
+    panel_type: str,
+) -> QtWidgets.QMenu:
+    from app.ui.widgets.actions import video_control_actions
+
+    scan_active = video_control_actions.is_issue_scan_active(main_window)
+    menu = QtWidgets.QMenu(list_widget)
+
+    if panel_type == "target_media":
+        clear_action = QtGui.QAction("Clear All Media", menu)
+        clear_action.setEnabled(bool(main_window.target_videos) and not scan_active)
+        clear_action.triggered.connect(partial(clear_all_target_media, main_window))
+    elif panel_type == "input_faces":
+        clear_action = QtGui.QAction("Clear All Faces", menu)
+        clear_action.setEnabled(bool(main_window.input_faces) and not scan_active)
+        clear_action.triggered.connect(partial(clear_all_input_faces, main_window))
+    else:
+        clear_action = QtGui.QAction("Clear All Embeddings", menu)
+        clear_action.setEnabled(bool(main_window.merged_embeddings) and not scan_active)
+        clear_action.triggered.connect(partial(clear_all_embeddings, main_window))
+
+    menu.addAction(clear_action)
+    return menu
+
+
+def _show_panel_context_menu(
+    main_window: "MainWindow",
+    list_widget: QtWidgets.QListWidget,
+    panel_type: str,
+    position: QtCore.QPoint,
+) -> None:
+    if list_widget.itemAt(position) is not None:
+        return
+
+    menu = _build_panel_context_menu(main_window, list_widget, panel_type)
+    menu.exec(list_widget.viewport().mapToGlobal(position))
+
+
+def _set_up_panel_context_menu(
+    main_window: "MainWindow",
+    list_widget: QtWidgets.QListWidget,
+    panel_type: str,
+) -> None:
+    list_widget.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+    list_widget.customContextMenuRequested.connect(
+        partial(_show_panel_context_menu, main_window, list_widget, panel_type)
+    )
 
 
 @QtCore.Slot()
 def select_input_face_images(
     main_window: "MainWindow", source_type="folder", folder_name=False, files_list=None
 ):
+    from app.ui.widgets.actions import video_control_actions
+
+    if video_control_actions.block_if_issue_scan_active(
+        main_window, "load input faces"
+    ):
+        return
+
     files_list = files_list or []
     if source_type == "folder":
         folder_name = QtWidgets.QFileDialog.getExistingDirectory(
@@ -350,8 +778,8 @@ def select_input_face_images(
         )
         if not folder_name:
             return
-        main_window.labelInputFacesPath.setText(misc_helpers.truncate_text(folder_name))
-        main_window.labelInputFacesPath.setToolTip(folder_name)
+        main_window.inputFacesPathLineEdit.setText(folder_name)
+        main_window.inputFacesPathLineEdit.setToolTip(folder_name)
         main_window.last_input_media_folder_path = folder_name
 
     elif source_type == "files":
@@ -359,10 +787,8 @@ def select_input_face_images(
         if not files_list:
             return
         file_dir = misc_helpers.get_dir_of_file(files_list[0])
-        main_window.labelInputFacesPath.setText(
-            file_dir
-        )  # Just a temp text until i think of something better
-        main_window.labelInputFacesPath.setToolTip(file_dir)
+        main_window.inputFacesPathLineEdit.setText(file_dir)
+        main_window.inputFacesPathLineEdit.setToolTip(file_dir)
         main_window.last_input_media_folder_path = file_dir
 
     clear_stop_loading_input_media(main_window)
@@ -414,7 +840,7 @@ def set_up_list_widget_placeholder(
 
 
 def select_output_media_folder(main_window: "MainWindow"):
-    folder_name = QtWidgets.QFileDialog.getExistingDirectory()
+    folder_name = QtWidgets.QFileDialog.getExistingDirectory(main_window)
     if folder_name:
         main_window.outputFolderLineEdit.setText(folder_name)
         common_widget_actions.create_control(
@@ -422,44 +848,89 @@ def select_output_media_folder(main_window: "MainWindow"):
         )
 
 
-def open_output_media_folder(main_window: "MainWindow"):
-    folder_name = main_window.control.get("OutputMediaFolder")
-    if isinstance(folder_name, str) and folder_name:
-        if os.path.exists(folder_name):
-            # Normalize path
-            normalized_path = os.path.normpath(os.path.abspath(folder_name))
+def _show_missing_folder_message(
+    main_window: "MainWindow", folder_label: str, folder_name: str | None = None
+) -> None:
+    if folder_name:
+        message = f"Could not find:\n{folder_name}"
+    else:
+        message = f"No {folder_label.lower()} is currently set."
+    common_widget_actions.create_and_show_messagebox(
+        main_window,
+        f"{folder_label} Unavailable",
+        message,
+        parent_widget=main_window,
+    )
 
-            if sys.platform == "win32":
-                # Windows - use full path to explorer.exe to avoid PATH issues
-                try:
-                    # Method 1: Using subprocess without shell (more secure and reliable)
-                    subprocess.Popen(["explorer", normalized_path])
-                except FileNotFoundError:
-                    # Fallback: Use full path to explorer.exe
-                    subprocess.Popen([r"C:\Windows\explorer.exe", normalized_path])
-            elif sys.platform == "darwin":
-                # macOS
-                subprocess.run(["open", "-R", folder_name])
-            else:
-                # Linux
-                directory = os.path.dirname(os.path.abspath(folder_name))
-                subprocess.run(["xdg-open", directory])
+
+def _open_folder_in_file_manager(main_window: "MainWindow", folder_name: str) -> None:
+    normalized_path = os.path.normpath(os.path.abspath(folder_name))
+
+    if sys.platform == "win32":
+        try:
+            subprocess.Popen(["explorer", normalized_path])
+        except FileNotFoundError:
+            subprocess.Popen([r"C:\Windows\explorer.exe", normalized_path])
+    elif sys.platform == "darwin":
+        subprocess.run(["open", normalized_path])
+    else:
+        subprocess.run(["xdg-open", normalized_path])
+
+
+def open_output_media_folder(main_window: "MainWindow", folder_name: str | None = None):
+    if not folder_name:
+        configured_folder = main_window.control.get("OutputMediaFolder")
+        folder_name = configured_folder if isinstance(configured_folder, str) else None
+    if not isinstance(folder_name, str) or not folder_name.strip():
+        _show_missing_folder_message(main_window, "Output Folder")
+        return
+    if not os.path.isdir(folder_name):
+        _show_missing_folder_message(main_window, "Output Folder", folder_name)
+        return
+    _open_folder_in_file_manager(main_window, folder_name)
+
+
+def open_target_media_folder(main_window: "MainWindow"):
+    folder_name = main_window.targetVideosPathLineEdit.text().strip()
+    if not folder_name:
+        folder_name = getattr(main_window, "last_target_media_folder_path", "").strip()
+    if not folder_name:
+        _show_missing_folder_message(main_window, "Target Media Folder")
+        return
+    if not os.path.isdir(folder_name):
+        _show_missing_folder_message(main_window, "Target Media Folder", folder_name)
+        return
+    _open_folder_in_file_manager(main_window, folder_name)
+
+
+def open_input_faces_folder(main_window: "MainWindow"):
+    folder_name = main_window.inputFacesPathLineEdit.text().strip()
+    if not folder_name:
+        folder_name = getattr(main_window, "last_input_media_folder_path", "").strip()
+    if not folder_name:
+        _show_missing_folder_message(main_window, "Input Faces Folder")
+        return
+    if not os.path.isdir(folder_name):
+        _show_missing_folder_message(main_window, "Input Faces Folder", folder_name)
+        return
+    _open_folder_in_file_manager(main_window, folder_name)
 
 
 def show_shortcuts(main_window: "MainWindow"):
     # HTML formating
     shortcuts_text = (
         "<b><u>Actions:</u></b><br>"
-        "<b>F11</b> : View fullscreen<br>"
+        "<b>F11</b> : Fullscreen<br>"
+        "<b>T</b> : Theatre Mode<br>"
         "<b>Space</b> : Play/Stop<br>"
         "<b>R</b> : Record start/stop<br>"
-        "<b>S</b> : Swap face"
+        "<b>S</b> : Swap face<br>"
         "<br>"
         "<b><u>Seeking:</u></b><br>"
         "<b>V</b> : Advance 1 frame<br>"
         "<b>C</b> : Rewind 1 frame<br>"
-        "<b>D</b> : Advance 30 frames<br>"
-        "<b>A</b> : Rewind 30 frames<br>"
+        "<b>D</b> : Advance frames by slider value<br>"
+        "<b>A</b> : Rewind frames by slider value<br>"
         "<b>Z</b> : Seek to start<br>"
         "<br>"
         "<b><u>Markers:</u></b><br>"
@@ -467,6 +938,13 @@ def show_shortcuts(main_window: "MainWindow"):
         "<b>ALT+F</b> : Remove video marker<br>"
         "<b>W</b> : Move to next marker<br>"
         "<b>Q</b> : Move to previous marker<br>"
+        "<br>"
+        "<b><u>Viewport:</u></b><br>"
+        "<b>Ctrl+0</b> : Fit to View<br>"
+        "<b>Ctrl+1</b> : 100% Zoom<br>"
+        "<b>Middle Mouse Drag</b> : Pan view<br>"
+        "<b>X</b> : Face Compare<br>"
+        "<b>Right Click</b> : Viewport menu (Fit to View, 100% Zoom, Save Image)<br>"
         "<br>"
     )
 
@@ -509,3 +987,104 @@ def show_presets(main_window: "MainWindow"):
         presets_text,
         main_window,
     )
+
+
+def _get_app_display_metadata(main_window: "MainWindow") -> AppDisplayMetadata:
+    metadata = getattr(main_window, "app_display_metadata", None)
+    if metadata is not None:
+        return metadata
+
+    base_title = getattr(main_window, "_base_window_title", main_window.windowTitle())
+    return get_app_display_metadata(main_window.project_root_path, base_title)
+
+
+def _open_about_link(main_window: "MainWindow", link_type: str):
+    project_root = Path(main_window.project_root_path)
+    local_links = {
+        "quickstart": project_root / "docs" / "quickstart.md",
+        "manual": project_root / "docs" / "user_manual.md",
+    }
+    remote_links = {
+        "github": "https://github.com/VisoMasterFusion/VisoMaster-Fusion",
+        "discord": "https://discord.gg/5rx4SQuDbp",
+    }
+
+    if link_type in local_links:
+        target_path = local_links[link_type]
+        if target_path.is_file():
+            QtGui.QDesktopServices.openUrl(
+                QtCore.QUrl.fromLocalFile(str(target_path.resolve()))
+            )
+        else:
+            common_widget_actions.create_and_show_messagebox(
+                main_window,
+                "Document Not Found",
+                f"Could not find:\n{target_path}",
+                parent_widget=main_window,
+            )
+        return
+
+    target_url = remote_links.get(link_type)
+    if target_url:
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl(target_url))
+
+
+def show_about(main_window: "MainWindow"):
+    dialog = QtWidgets.QDialog(main_window)
+    dialog.setWindowTitle("About")
+    dialog.setModal(True)
+    dialog.setMinimumWidth(420)
+
+    layout = QtWidgets.QVBoxLayout(dialog)
+    layout.setContentsMargins(18, 18, 18, 18)
+    layout.setSpacing(12)
+
+    title_label = QtWidgets.QLabel("VisoMaster Fusion", dialog)
+    title_font = title_label.font()
+    title_font.setPointSize(title_font.pointSize() + 2)
+    title_font.setBold(True)
+    title_label.setFont(title_font)
+
+    version_label = QtWidgets.QLabel(
+        _get_app_display_metadata(main_window).about_version_text, dialog
+    )
+    description_label = QtWidgets.QLabel(
+        "Advanced image and video editing toolkit.\n"
+        "See the User Manual for setup and usage guidance.",
+        dialog,
+    )
+    description_label.setWordWrap(True)
+
+    links_group = QtWidgets.QGroupBox("Quick Links", dialog)
+    links_layout = QtWidgets.QVBoxLayout(links_group)
+    links_layout.setContentsMargins(12, 12, 12, 12)
+    links_layout.setSpacing(6)
+
+    links_label = QtWidgets.QLabel(links_group)
+    links_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
+    links_label.setTextInteractionFlags(
+        QtCore.Qt.TextInteractionFlag.TextBrowserInteraction
+    )
+    links_label.setOpenExternalLinks(False)
+    links_label.setWordWrap(True)
+    links_label.setText(
+        '<a href="quickstart">Quick Start Guide</a><br>'
+        '<a href="manual">User Manual</a><br>'
+        '<a href="discord">Discord</a><br>'
+        '<a href="github">GitHub</a>'
+    )
+    links_label.linkActivated.connect(
+        lambda link_type: _open_about_link(main_window, link_type)
+    )
+    links_layout.addWidget(links_label)
+
+    close_button = QtWidgets.QPushButton("Close", dialog)
+    close_button.clicked.connect(dialog.accept)
+
+    layout.addWidget(title_label)
+    layout.addWidget(version_label)
+    layout.addWidget(description_label)
+    layout.addWidget(links_group)
+    layout.addWidget(close_button, alignment=QtCore.Qt.AlignmentFlag.AlignRight)
+
+    dialog.exec()

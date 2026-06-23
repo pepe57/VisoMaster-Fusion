@@ -8,12 +8,20 @@ from PySide6 import QtWidgets, QtCore, QtGui
 from app.ui.widgets import widget_components
 from app.ui.widgets.settings_layout_data import SETTINGS_LAYOUT_DATA
 from app.ui.widgets.common_layout_data import COMMON_LAYOUT_DATA
+from app.ui.widgets.denoiser_layout_data import DENOISER_LAYOUT_DATA
 import app.helpers.miscellaneous as misc_helpers
 from app.helpers.miscellaneous import get_video_rotation
 from app.helpers.typing_helper import ControlTypes
 
 if TYPE_CHECKING:
     from app.ui.main_ui import MainWindow
+
+# PERF-01: Module-level constant built once from layout data, reused in set_control_widgets_values
+_ALL_CONTROL_WIDGET_OPTIONS: dict = {}
+for _layout_source in [SETTINGS_LAYOUT_DATA, COMMON_LAYOUT_DATA, DENOISER_LAYOUT_DATA]:
+    for _group_data in _layout_source.values():
+        for _widget_key, _widget_data in _group_data.items():
+            _ALL_CONTROL_WIDGET_OPTIONS[_widget_key] = _widget_data
 
 
 @QtCore.Slot(str, str, QtWidgets.QWidget)
@@ -47,7 +55,7 @@ def create_and_show_toast_message(
     toast = Toast(main_window)
     toast.setTitle(title)
     toast.setText(message)
-    toast.setDuration(1400)
+    toast.setDuration(10000)
     toast.setPosition(ToastPosition.TOP_RIGHT)  # Default: ToastPosition.BOTTOM_RIGHT
     toast.applyPreset(style_preset_map[style_type])  # Apply style preset
     toast.show()
@@ -68,8 +76,9 @@ def update_control(
     current_position = main_window.videoSeekSlider.value()
 
     # Update marker control too
-    # Do not update values of control with exec_function (like max threads count) as it would slow down the app heavily
-    if main_window.markers.get(current_position) and not exec_function:
+    # FIX: We MUST update the dictionary value regardless of the exec_function,
+    # otherwise marker data becomes stale and reverts user changes on seek.
+    if main_window.markers.get(current_position):
         main_window.markers[current_position]["control"][control_name] = control_value
 
     if exec_function:
@@ -78,20 +87,23 @@ def update_control(
             # By default an exec function definition should have atleast one parameter : MainWindow
             exec_function_args = [main_window, control_value] + exec_function_args
             exec_function(*exec_function_args)
+
     main_window.control[control_name] = control_value
+
     # Also update the feeder's state if it's running
-    if (
-        main_window.video_processor.processing
-        and main_window.video_processor.feeder_control
-    ):
+    # BUG-16 / THREAD-03: feeder_control None check moved inside the lock to prevent TOCTOU race
+    if hasattr(main_window, "video_processor") and main_window.video_processor:
+        # --- DIRTY FLAG ---
+        main_window.video_processor.ui_state_is_dirty = True
         with main_window.video_processor.state_lock:
             # Cast to ControlTypes to satisfy the type checker, as feeder_control is typed
-            if control_name in cast(
+            if main_window.video_processor.feeder_control and control_name in cast(
                 ControlTypes, main_window.video_processor.feeder_control
             ):
                 cast(ControlTypes, main_window.video_processor.feeder_control)[
                     control_name
                 ] = control_value
+
     refresh_frame(main_window)
 
 
@@ -154,12 +166,15 @@ def update_parameter(
     if main_window.target_faces and face_id:
         main_window.parameters[face_id][parameter_name] = parameter_value
         # Also update the feeder's state if it's running
-        if (
-            main_window.video_processor.processing
-            and main_window.video_processor.feeder_parameters
-        ):
+        # BUG-16 / THREAD-03: feeder_parameters None check moved inside the lock to prevent TOCTOU race
+        if hasattr(main_window, "video_processor") and main_window.video_processor:
+            # --- DIRTY FLAG ---
+            main_window.video_processor.ui_state_is_dirty = True
             with main_window.video_processor.state_lock:
-                if face_id in main_window.video_processor.feeder_parameters:
+                if (
+                    main_window.video_processor.feeder_parameters
+                    and face_id in main_window.video_processor.feeder_parameters
+                ):
                     main_window.video_processor.feeder_parameters[face_id][
                         parameter_name
                     ] = parameter_value
@@ -183,9 +198,157 @@ def update_parameter(
 
 
 def refresh_frame(main_window: "MainWindow", synchronous: bool = False):
+    # PERF-05: Skip frame refresh if a batch update is in progress
+    if getattr(main_window, "_batch_update_in_progress", False):
+        return
     video_processor = main_window.video_processor
     if not video_processor.processing:
         video_processor.process_current_frame(synchronous=synchronous)
+
+
+def _resolve_target_face_id(
+    main_window: "MainWindow", face_id: str | None = None
+) -> str | None:
+    resolved_face_id = face_id or main_window.selected_target_face_id
+    if resolved_face_id and resolved_face_id in main_window.target_faces:
+        return resolved_face_id
+    return None
+
+
+def _show_target_face_parameter_message(
+    main_window: "MainWindow", title: str, message: str
+):
+    create_and_show_messagebox(
+        main_window,
+        title,
+        message,
+        parent_widget=main_window,
+    )
+
+
+def copy_selected_face_parameters(
+    main_window: "MainWindow", face_id: str | None = None
+) -> bool:
+    face_id = _resolve_target_face_id(main_window, face_id)
+    if not face_id:
+        _show_target_face_parameter_message(
+            main_window,
+            "No target face selected",
+            "Select a target face before copying parameters.",
+        )
+        return False
+
+    face_parameters = main_window.parameters.get(face_id)
+    if not face_parameters:
+        _show_target_face_parameter_message(
+            main_window,
+            "No parameters found",
+            "The selected target face has no parameters to copy.",
+        )
+        return False
+
+    main_window.copied_parameters = face_parameters.copy()
+    return True
+
+
+def paste_selected_face_parameters(
+    main_window: "MainWindow", face_id: str | None = None
+) -> bool:
+    from app.ui.widgets.actions import video_control_actions
+
+    if video_control_actions.block_if_issue_scan_active(
+        main_window, "apply copied parameters"
+    ):
+        return False
+
+    face_id = _resolve_target_face_id(main_window, face_id)
+    if not face_id:
+        _show_target_face_parameter_message(
+            main_window,
+            "No target face selected",
+            "Select a target face before pasting parameters.",
+        )
+        return False
+
+    if not main_window.copied_parameters:
+        _show_target_face_parameter_message(
+            main_window,
+            "No parameters found in Clipboard",
+            "You need to copy parameters from any of the target face before pasting it!",
+        )
+        return False
+
+    main_window.parameters[face_id] = main_window.copied_parameters.copy()
+    # --- DIRTY FLAG ---
+    if hasattr(main_window, "video_processor") and main_window.video_processor:
+        if main_window.video_processor.processing:
+            main_window.video_processor.ui_state_is_dirty = True
+            with main_window.video_processor.state_lock:
+                if (
+                    main_window.video_processor.feeder_parameters
+                    and face_id in main_window.video_processor.feeder_parameters
+                ):
+                    import copy
+
+                    main_window.video_processor.feeder_parameters[face_id] = (
+                        copy.deepcopy(main_window.parameters[face_id])
+                    )
+    set_widgets_values_using_face_id_parameters(main_window, face_id=face_id)
+    return True
+
+
+def reset_selected_face_parameters(
+    main_window: "MainWindow", face_id: str | None = None
+) -> bool:
+    face_id = _resolve_target_face_id(main_window, face_id)
+    if not face_id:
+        _show_target_face_parameter_message(
+            main_window,
+            "No target face selected",
+            "Select a target face before resetting parameters.",
+        )
+        return False
+
+    main_window.parameters[face_id] = main_window.default_parameters.copy()
+    # --- DIRTY FLAG ---
+    if hasattr(main_window, "video_processor") and main_window.video_processor:
+        if main_window.video_processor.processing:
+            main_window.video_processor.ui_state_is_dirty = True
+            with main_window.video_processor.state_lock:
+                if (
+                    main_window.video_processor.feeder_parameters
+                    and face_id in main_window.video_processor.feeder_parameters
+                ):
+                    import copy
+
+                    main_window.video_processor.feeder_parameters[face_id] = (
+                        copy.deepcopy(main_window.parameters[face_id])
+                    )
+    set_widgets_values_using_face_id_parameters(main_window, face_id=face_id)
+    return True
+
+
+# Keep a parameter row container and its child widgets in sync when hiding/showing
+# dependency-driven controls.
+def set_parameter_row_visibility(current_widget, visible: bool):
+    if hasattr(current_widget, "row_widget") and current_widget.row_widget:
+        current_widget.row_widget.setVisible(visible)
+    else:
+        current_widget.setVisible(visible)
+    if hasattr(current_widget, "below_row_widget") and current_widget.below_row_widget:
+        current_widget.below_row_widget.setVisible(visible)
+
+    # Keep the child widgets in sync so internal widget state matches the row state.
+    current_widget.setVisible(visible)
+    if hasattr(current_widget, "label_widget") and current_widget.label_widget:
+        current_widget.label_widget.setVisible(visible)
+    if (
+        hasattr(current_widget, "reset_default_button")
+        and current_widget.reset_default_button
+    ):
+        current_widget.reset_default_button.setVisible(visible)
+    if hasattr(current_widget, "line_edit") and current_widget.line_edit:
+        current_widget.line_edit.setVisible(visible)
 
 
 # Function to Hide Elements conditionally from values in LayoutData (Currently supports using Selection box and Toggle button to hide other widgets)
@@ -198,154 +361,151 @@ def show_hide_related_widgets(
 ):
     if main_window.parameter_widgets:
         group_layout_data = parent_widget.group_layout_data  # Dictionary contaning layout data of all elements in the group of the parent_widget
+
+        # --- CASE 1: PARENT IS A SELECTION BOX (e.g., Simple/Advanced) ---
         if "Selection" in parent_widget_name:
-            # Loop through all widgets data in the parent widget's group layout data
             for widget_name in group_layout_data.keys():
-                # Store the widget object (instance) from the parameters_widgets Dictionary
                 current_widget = main_window.parameter_widgets.get(widget_name)
-                # Check if the current_widget depends on the Parent Widget's (selection) value
+                layout_info = group_layout_data[widget_name]
+
+                # Only process widgets that depend on THIS selection box
                 if (
-                    group_layout_data[widget_name].get("parentSelection", "")
-                    == parent_widget_name
+                    layout_info.get("parentSelection", "") == parent_widget_name
                     and current_widget
                 ):
-                    # Check if the current_widget has the required value of Parent Widget's (selection) current value to hide/show the current_widget
-                    if (
-                        group_layout_data[widget_name].get("requiredSelectionValue")
-                        != parent_widget.currentText()
-                    ):
-                        current_widget.hide()
-                        current_widget.label_widget.hide()
-                        current_widget.reset_default_button.hide()
-                        if current_widget.line_edit:
-                            current_widget.line_edit.hide()
-                    else:
-                        current_widget.show()
-                        current_widget.label_widget.show()
-                        current_widget.reset_default_button.show()
-                        if current_widget.line_edit:
-                            current_widget.line_edit.show()
+                    # 1. Check Selection Condition
+                    selection_condition_met = (
+                        layout_info.get("requiredSelectionValue")
+                        == parent_widget.currentText()
+                    )
 
+                    # 2. Check Toggle Condition (Cross-Check)
+                    # Even if selection matches, we must check if the parent toggles are ON
+                    toggle_condition_met = True
+                    parentToggles = layout_info.get("parentToggle", "")
+
+                    if parentToggles and selection_condition_met:
+                        if "&" in parentToggles:
+                            toggles = [t.strip() for t in parentToggles.split("&")]
+                            for t_name in toggles:
+                                t_widget = main_window.parameter_widgets.get(t_name)
+                                if t_widget and not t_widget.isChecked():
+                                    toggle_condition_met = False
+                                    break
+                        elif "|" in parentToggles:
+                            toggle_condition_met = False
+                            toggles = [t.strip() for t in parentToggles.split("|")]
+                            for t_name in toggles:
+                                t_widget = main_window.parameter_widgets.get(t_name)
+                                if t_widget and t_widget.isChecked():
+                                    toggle_condition_met = True
+                                    break
+                        else:
+                            # Single toggle or simple logic
+                            t_widget = main_window.parameter_widgets.get(parentToggles)
+                            required_val = layout_info.get("requiredToggleValue", True)
+                            if t_widget and t_widget.isChecked() != required_val:
+                                toggle_condition_met = False
+
+                    # Final Decision
+                    if selection_condition_met and toggle_condition_met:
+                        set_parameter_row_visibility(current_widget, True)
+                    else:
+                        set_parameter_row_visibility(current_widget, False)
+
+        # --- CASE 2: PARENT IS A TOGGLE BUTTON ---
         elif "Toggle" in parent_widget_name:
-            # Loop through all widgets data in the parent widget's group layout data
             for widget_name in group_layout_data.keys():
-                # Store the widget object (instance) from the parameters_widgets Dictionary
                 if widget_name not in main_window.parameter_widgets:
                     continue
                 current_widget = main_window.parameter_widgets[widget_name]
-                # Check if the current_widget depends on the Parent Widget's (toggle) value
-                parentToggles = group_layout_data[widget_name].get("parentToggle", "")
+                layout_info = group_layout_data[widget_name]
+
+                parentToggles = layout_info.get("parentToggle", "")
+
+                # Only process widgets that depend on THIS toggle (or have it in their chain)
                 if parent_widget_name in parentToggles:
+                    # 1. Check Selection Condition (Cross-Check)
+                    # Before evaluating toggles, check if the parent Selection is valid
+                    selection_condition_met = True
+                    parentSelection = layout_info.get("parentSelection", "")
+                    if parentSelection:
+                        sel_widget = main_window.parameter_widgets.get(parentSelection)
+                        if sel_widget and sel_widget.currentText() != layout_info.get(
+                            "requiredSelectionValue"
+                        ):
+                            selection_condition_met = False
+
+                    # 2. Check Toggle Condition
+                    toggle_condition_met = False
+
+                    # DEPRECATED: comma-separated toggle syntax; evaluates only the last toggle. Use '&' or '|' instead.
                     if "," in parentToggles:
+                        # Legacy comma logic (iterative check)
                         result = [item.strip() for item in parentToggles.split(",")]
                         parentToggle_ischecked = False
                         for _, required_widget_name in enumerate(result):
-                            parentToggle_ischecked = main_window.parameter_widgets[
-                                required_widget_name
-                            ].isChecked()
-                        # Check if the current_widget has the required toggle value of Parent Widget's (toggle) checked state to hide/show the current_widget
-                        if (
-                            group_layout_data[widget_name].get("requiredToggleValue")
-                            != parentToggle_ischecked
-                        ):
-                            current_widget.hide()
-                            current_widget.label_widget.hide()
-                            current_widget.reset_default_button.hide()
-                            if current_widget.line_edit:
-                                current_widget.line_edit.hide()
-                        else:
-                            current_widget.show()
-                            current_widget.label_widget.show()
-                            current_widget.reset_default_button.show()
-                            if current_widget.line_edit:
-                                current_widget.line_edit.show()
-                    elif "|" in parentToggles:
-                        result = [item.strip() for item in parentToggles.split("|")]
-                        parentToggle_ischecked = True
-                        # Check if any of the parentToggles are checked
-                        for _, required_widget_name in enumerate(result):
-                            ischecked = main_window.parameter_widgets[
-                                required_widget_name
-                            ].isChecked()
-                            if ischecked:
-                                parentToggle_ischecked = True
-                                break
-                            else:
-                                parentToggle_ischecked = False
+                            w = main_window.parameter_widgets.get(required_widget_name)
+                            if w:
+                                parentToggle_ischecked = w.isChecked()
 
-                        # Check if the current_widget has the required toggle value of Parent Widget's (toggle) checked state to hide/show the current_widget
                         if (
-                            group_layout_data[widget_name].get("requiredToggleValue")
-                            != parentToggle_ischecked
+                            layout_info.get("requiredToggleValue")
+                            == parentToggle_ischecked
                         ):
-                            current_widget.hide()
-                            current_widget.label_widget.hide()
-                            current_widget.reset_default_button.hide()
-                            if current_widget.line_edit:
-                                current_widget.line_edit.hide()
-                        else:
-                            current_widget.show()
-                            current_widget.label_widget.show()
-                            current_widget.reset_default_button.show()
-                            if current_widget.line_edit:
-                                current_widget.line_edit.show()
+                            toggle_condition_met = True
+
+                    elif "|" in parentToggles:
+                        # OR Logic
+                        result = [item.strip() for item in parentToggles.split("|")]
+                        any_checked = False
+                        for required_widget_name in result:
+                            w = main_window.parameter_widgets.get(required_widget_name)
+                            if w and w.isChecked():
+                                any_checked = True
+                                break
+
+                        if layout_info.get("requiredToggleValue") == any_checked:
+                            toggle_condition_met = True
 
                     elif "&" in parentToggles:
+                        # AND Logic
                         result = [item.strip() for item in parentToggles.split("&")]
-                        parentToggle_ischecked = True
-                        # Check if any of the parentToggles are checked
-                        for _, required_widget_name in enumerate(result):
-                            ischecked = main_window.parameter_widgets[
-                                required_widget_name
-                            ].isChecked()
-                            parentToggle_ischecked = (
-                                parentToggle_ischecked and ischecked
-                            )
+                        all_checked = True
+                        for required_widget_name in result:
+                            w = main_window.parameter_widgets.get(required_widget_name)
+                            if w and not w.isChecked():
+                                all_checked = False
+                                break
 
-                        # Check if the current_widget has the required toggle value of Parent Widget's (toggle) checked state to hide/show the current_widget
-                        if (
-                            group_layout_data[widget_name].get("requiredToggleValue")
-                            != parentToggle_ischecked
-                        ):
-                            current_widget.hide()
-                            current_widget.label_widget.hide()
-                            current_widget.reset_default_button.hide()
-                            if current_widget.line_edit:
-                                current_widget.line_edit.hide()
-                        else:
-                            current_widget.show()
-                            current_widget.label_widget.show()
-                            current_widget.reset_default_button.show()
-                            if current_widget.line_edit:
-                                current_widget.line_edit.show()
+                        if layout_info.get("requiredToggleValue") == all_checked:
+                            toggle_condition_met = True
 
                     else:
-                        parentToggle_ischecked = main_window.parameter_widgets[
-                            parentToggles
-                        ].isChecked()
+                        # Single Toggle
+                        w = main_window.parameter_widgets.get(parentToggles)
+                        parentToggle_ischecked = w.isChecked() if w else False
                         if (
-                            group_layout_data[widget_name].get("requiredToggleValue")
-                            != parentToggle_ischecked
+                            layout_info.get("requiredToggleValue")
+                            == parentToggle_ischecked
                         ):
-                            current_widget.hide()
-                            current_widget.label_widget.hide()
-                            current_widget.reset_default_button.hide()
-                            if current_widget.line_edit:
-                                current_widget.line_edit.hide()
-                        else:
-                            current_widget.show()
-                            current_widget.label_widget.show()
-                            current_widget.reset_default_button.show()
-                            if current_widget.line_edit:
-                                current_widget.line_edit.show()
+                            toggle_condition_met = True
+
+                    # Final Decision
+                    if selection_condition_met and toggle_condition_met:
+                        set_parameter_row_visibility(current_widget, True)
+                    else:
+                        set_parameter_row_visibility(current_widget, False)
 
             parent_widget.start_animation()
 
 
 # @misc_helpers.benchmark
 def get_pixmap_from_frame(main_window: "MainWindow", frame: np.ndarray):
+    frame = np.ascontiguousarray(frame)
     height, width, channel = frame.shape
-    if channel == 2:
+    # BUG-04: Grayscale check should be channel==1, not 2
+    if channel == 1:
         # Frame in grayscale
         bytes_per_line = width
         q_img = QtGui.QImage(
@@ -365,11 +525,8 @@ def get_pixmap_from_frame(main_window: "MainWindow", frame: np.ndarray):
     return pixmap
 
 
+# QUAL-02: Inlined _update_gpu_memory_progressbar body directly; removed the redundant wrapper function
 def update_gpu_memory_progressbar(main_window: "MainWindow"):
-    _update_gpu_memory_progressbar(main_window)
-
-
-def _update_gpu_memory_progressbar(main_window: "MainWindow"):
     memory_used, memory_total = main_window.models_processor.get_gpu_memory()
     main_window.gpu_memory_update_signal.emit(memory_used, memory_total)
 
@@ -383,41 +540,45 @@ def set_gpu_memory_progressbar_value(
     main_window.vramProgressBar.setFormat(
         f"{round(memory_used / 1024, 2)} GB / {round(memory_total / 1024, 2)} GB (%p%)"
     )
-    # Base style copied from true_dark_styles.qss
-    base_style = """
-        QProgressBar {
-            border: 1px solid #363636;
+    palette = main_window.vramProgressBar.palette()
+    background_color = palette.color(QtGui.QPalette.ColorRole.Base).name()
+    text_color = palette.color(QtGui.QPalette.ColorRole.Text).name()
+    border_color = palette.color(QtGui.QPalette.ColorRole.Mid).name()
+
+    base_style = f"""
+        QProgressBar {{
+            border: 1px solid {border_color};
             border-radius: 5px;
             text-align: center;
-            background-color: #202020;
-            color: #f0f0f0;
-        }
+            background-color: {background_color};
+            color: {text_color};
+        }}
     """
 
-    # Base Chunk style copied from true_dark_styles.qss
     chunk_style_normal = """
         QProgressBar::chunk {
-            background-color: #16759e;  /* Blue */
-            width: 10px;
-            margin: 0.5px;
+            background-color: #16759e;
             border-radius: 4px;
         }
     """
 
-    # High VRAM Chunck style
     chunk_style_high = """
         QProgressBar::chunk {
             background-color: #911414; /* Red */
-            width: 10px;
-            margin: 0.5px;
             border-radius: 4px;
         }
     """
 
-    if (memory_used / memory_total) > 0.85:
-        main_window.vramProgressBar.setStyleSheet(base_style + chunk_style_high)
-    else:
-        main_window.vramProgressBar.setStyleSheet(base_style + chunk_style_normal)
+    is_high = memory_total > 0 and (memory_used / memory_total) > 0.85
+    was_high = getattr(main_window, "_vram_high_style_active", None)
+    current_style = base_style + (chunk_style_high if is_high else chunk_style_normal)
+    if (
+        is_high != was_high
+        or getattr(main_window, "_vram_progressbar_style", None) != current_style
+    ):
+        main_window._vram_high_style_active = is_high
+        main_window._vram_progressbar_style = current_style
+        main_window.vramProgressBar.setStyleSheet(current_style)
 
     main_window.vramProgressBar.update()
 
@@ -433,28 +594,33 @@ def clear_gpu_memory(main_window: "MainWindow"):
     main_window.videoSeekSlider.update()
 
 
-def extract_frame_as_pixmap(
+def extract_frame_as_image(
     main_window: "MainWindow",
     media_file_path,
     file_type,
     webcam_index=False,
     webcam_backend=False,
+    cache_thumbnail=True,
 ):
     """
-    Extracts a frame from a media file and converts it to a QPixmap for thumbnails.
-    It now uses the ThumbnailManager to efficiently cache and retrieve thumbnails.
+    Extracts a frame from a media file and converts it to a QImage for thumbnails.
+    Returns a thread-safe QImage to avoid GUI/GPU crashes from background workers.
+    It uses the ThumbnailManager to efficiently cache and retrieve thumbnails.
     """
 
-    # This helper function converts a numpy frame to a scaled QPixmap.
-    def convert_frame_to_pixmap(frame):
+    # This helper function converts a numpy frame to a scaled QImage safely.
+    def convert_frame_to_image(frame):
+        frame = np.ascontiguousarray(frame)
         height, width, _ = frame.shape
         bytes_per_line = 3 * width
+
+        # Format_RGB888 strictly respects PySide6 enums
         q_img = QtGui.QImage(
-            frame.data, width, height, bytes_per_line, QtGui.QImage.Format_RGB888
+            frame.data, width, height, bytes_per_line, QtGui.QImage.Format.Format_RGB888
         ).rgbSwapped()
-        pixmap = QtGui.QPixmap.fromImage(q_img)
-        # The final scaling for display is consistent.
-        return pixmap.scaled(70, 70, QtCore.Qt.AspectRatioMode.KeepAspectRatio)
+
+        # .scaled() returns a deep copy, completely decoupling from the numpy array memory!
+        return q_img.scaled(70, 70, QtCore.Qt.AspectRatioMode.KeepAspectRatio)
 
     # For images and videos, first check for a cached thumbnail.
     if file_type in ["image", "video"]:
@@ -463,47 +629,118 @@ def extract_frame_as_pixmap(
             media_file_path
         )
 
+        # Freshness check: if the source file has been modified more recently
+        # than the cached thumbnail (e.g., the user re-recorded over the same
+        # filename), force regeneration. Without this guard a stale thumbnail
+        # is served indefinitely.
+        if thumbnail_path:
+            try:
+                import os as _os
+
+                if _os.path.getmtime(thumbnail_path) < _os.path.getmtime(
+                    media_file_path
+                ):
+                    thumbnail_path = None
+            except OSError:
+                pass  # source file missing — fall through to regeneration
+
         if thumbnail_path:
             frame = misc_helpers.read_image_file(thumbnail_path)
             if frame is not None:
-                return convert_frame_to_pixmap(frame)
+                return convert_frame_to_image(frame)
 
     # If no cache is found, or for webcams, generate the frame from source.
     frame = None
     if file_type == "image":
         frame = misc_helpers.read_image_file(media_file_path)
     elif file_type == "video":
-        # MODIFICATION: Get rotation for thumbnail
+        # Get rotation for thumbnail
         rotation_angle = get_video_rotation(media_file_path)
-        cap = cv2.VideoCapture(media_file_path)
-        if cap.isOpened():
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            middle_frame_no = total_frames // 2
-            cap.set(cv2.CAP_PROP_POS_FRAMES, middle_frame_no)
-            ret, frame = misc_helpers.read_frame(cap, rotation_angle)
-            cap.release()
+        # Retry up to 3 times with a 500 ms backoff.  Freshly recorded output files
+        # may still be held open by ffmpeg or the OS write cache when the media panel
+        # first tries to generate a thumbnail, causing cap.isOpened() to fail or
+        # CAP_PROP_FRAME_COUNT to return 0.  This is especially common on Windows 10.
+        import time as _time
+
+        for _attempt in range(3):
+            cap = cv2.VideoCapture(media_file_path)
+            if cap.isOpened():
+                # Explicitly enable OpenCV's auto-rotation
+                if hasattr(cv2, "CAP_PROP_ORIENTATION_AUTO"):
+                    cap.set(cv2.CAP_PROP_ORIENTATION_AUTO, 1)
+                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                if total_frames > 0:
+                    middle_frame_no = total_frames // 2
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, middle_frame_no)
+                    ret, frame = misc_helpers.read_frame(cap, rotation_angle)
+                    cap.release()
+                    if ret:
+                        break  # success — exit retry loop
+                    cap = None  # mark for next attempt
+                else:
+                    cap.release()
+                    cap = None
+            else:
+                cap = None
+            if _attempt < 2:
+                _time.sleep(0.5)  # wait before retry (file may still be flushed)
     elif file_type == "webcam":
         camera = cv2.VideoCapture(webcam_index, webcam_backend)
         if camera.isOpened():
-            # MODIFICATION: Pass 0 for webcam rotation
+            # Pass 0 for webcam rotation
             ret, frame = misc_helpers.read_frame(camera, 0)
             camera.release()  # Release camera immediately after grabbing one frame
 
     if isinstance(frame, np.ndarray):
         # Create a new thumbnail in the cache for next time.
-        if file_type != "webcam":
+        if file_type != "webcam" and cache_thumbnail:
             main_window.thumbnail_manager.create_thumbnail(frame, media_file_path)
 
-        # Return the generated pixmap.
-        return convert_frame_to_pixmap(frame)
+        # Return the generated thread-safe QImage.
+        return convert_frame_to_image(frame)
 
     return None  # Return None if everything failed.
 
 
+# QUAL-05: Helper to set a single widget's value based on its type, extracted from duplicate code
+def _set_single_widget_value(widget, value):
+    if isinstance(
+        widget,
+        (
+            widget_components.ParameterLineEdit,
+            widget_components.ParameterSlider,
+        ),
+    ):
+        try:
+            int_value = int(float(value))
+            widget.set_value(int_value)
+        except (ValueError, TypeError):
+            pass
+    elif isinstance(
+        widget,
+        (
+            widget_components.ParameterLineDecimalEdit,
+            widget_components.ParameterDecimalSlider,
+        ),
+    ):
+        try:
+            float_value = float(value)
+            widget.set_value(float_value)
+        except (ValueError, TypeError):
+            pass
+    elif isinstance(widget, widget_components.ToggleButton):
+        widget.set_value(bool(value))
+    elif isinstance(widget, widget_components.SelectionBox):
+        widget.set_value(str(value))
+    else:
+        widget.set_value(value)
+
+
+# QUAL-06: Changed face_id default from False to None; changed (face_id is False) to (not face_id)
 def set_widgets_values_using_face_id_parameters(
-    main_window: "MainWindow", face_id=False
+    main_window: "MainWindow", face_id=None
 ):
-    if (face_id is False) or (not main_window.parameters.get(face_id)):
+    if not face_id or (not main_window.parameters.get(face_id)):
         # print("Set widgets values using default parameters")
         if main_window.current_widget_parameters:
             parameters = main_window.current_widget_parameters.copy()
@@ -513,42 +750,24 @@ def set_widgets_values_using_face_id_parameters(
         # print(f"Set widgets values using face_id {face_id}")
         parameters = main_window.parameters[face_id].copy()
     parameter_widgets = main_window.parameter_widgets
-    for parameter_name, parameter_value in parameters.items():
-        widget = parameter_widgets.get(parameter_name)
-        if widget:
-            # temporarily disable refreshing the frame to prevent slowing due to unnecessary processing
-            widget.enable_refresh_frame = False
-            if isinstance(
-                widget,
-                (
-                    widget_components.ParameterLineEdit,
-                    widget_components.ParameterSlider,
-                ),
-            ):
-                try:
-                    int_value = int(float(parameter_value))
-                    widget.set_value(int_value)
-                except (ValueError, TypeError):
-                    pass
-            elif isinstance(
-                widget,
-                (
-                    widget_components.ParameterLineDecimalEdit,
-                    widget_components.ParameterDecimalSlider,
-                ),
-            ):
-                try:
-                    float_value = float(parameter_value)
-                    widget.set_value(float_value)
-                except (ValueError, TypeError):
-                    pass
-            elif isinstance(widget, widget_components.ToggleButton):
-                widget.set_value(bool(parameter_value))
-            elif isinstance(widget, widget_components.SelectionBox):
-                widget.set_value(str(parameter_value))
-            else:
-                widget.set_value(parameter_value)
-            widget.enable_refresh_frame = True
+    # Preserve outer suppression state so nested batch operations do not override it.
+    previous_batch_flag = getattr(main_window, "_batch_update_in_progress", False)
+    # PERF-05: Set batch update flag to suppress per-widget refresh_frame calls during the loop
+    main_window._batch_update_in_progress = True
+    try:
+        for parameter_name, parameter_value in parameters.items():
+            widget = parameter_widgets.get(parameter_name)
+            if widget:
+                # temporarily disable refreshing the frame to prevent slowing due to unnecessary processing
+                widget.enable_refresh_frame = False
+                # QUAL-05: Delegate to shared helper instead of inline isinstance chain
+                _set_single_widget_value(widget, parameter_value)
+                widget.enable_refresh_frame = True
+    finally:
+        main_window._batch_update_in_progress = previous_batch_flag
+        # Trigger a single refresh only if this function owns the outermost batch scope.
+        if not previous_batch_flag:
+            refresh_frame(main_window)
 
 
 def set_control_widgets_values(main_window: "MainWindow", enable_exec_func=True):
@@ -561,15 +780,8 @@ def set_control_widgets_values(main_window: "MainWindow", enable_exec_func=True)
     control = main_window.control.copy()
     parameter_widgets = main_window.parameter_widgets
 
-    # Prepare a dictionary of ALL widget options from layout data
-    all_widget_options = {}
-    for layout_data_source in [
-        SETTINGS_LAYOUT_DATA,
-        COMMON_LAYOUT_DATA,
-    ]:  # Iterate over both
-        for group_name, group_data in layout_data_source.items():
-            for widget_key, widget_data in group_data.items():
-                all_widget_options[widget_key] = widget_data
+    # PERF-01: Use the module-level pre-built constant instead of rebuilding the dict on every call
+    all_widget_options = _ALL_CONTROL_WIDGET_OPTIONS
 
     # Iterate through control items and update widgets
     for control_name, control_value in control.items():
@@ -579,37 +791,8 @@ def set_control_widgets_values(main_window: "MainWindow", enable_exec_func=True)
             # Temporarily disable frame refresh
             widget.enable_refresh_frame = False
 
-            # Set the widget value
-            if isinstance(
-                widget,
-                (
-                    widget_components.ParameterLineEdit,
-                    widget_components.ParameterSlider,
-                ),
-            ):
-                try:
-                    int_value = int(float(control_value))
-                    widget.set_value(int_value)
-                except (ValueError, TypeError):
-                    pass
-            elif isinstance(
-                widget,
-                (
-                    widget_components.ParameterLineDecimalEdit,
-                    widget_components.ParameterDecimalSlider,
-                ),
-            ):
-                try:
-                    float_value = float(control_value)
-                    widget.set_value(float_value)
-                except (ValueError, TypeError):
-                    pass
-            elif isinstance(widget, widget_components.ToggleButton):
-                widget.set_value(bool(control_value))
-            elif isinstance(widget, widget_components.SelectionBox):
-                widget.set_value(str(control_value))
-            else:
-                widget.set_value(control_value)
+            # QUAL-05: Delegate to shared helper instead of inline isinstance chain
+            _set_single_widget_value(widget, control_value)
 
             if enable_exec_func:
                 # Execute any associated function, if defined
